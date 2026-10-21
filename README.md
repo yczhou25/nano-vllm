@@ -43,6 +43,8 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+Pass `async_scheduling=True` to `LLM` to schedule the next step while the GPU runs the current one (experimental).
+
 ## Tests
 
 ```bash

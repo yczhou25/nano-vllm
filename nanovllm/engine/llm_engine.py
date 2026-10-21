@@ -32,6 +32,8 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.async_scheduling = config.async_scheduling
+        self.pending = None
         atexit.register(self.exit)
 
     def exit(self):
@@ -48,14 +50,27 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        assert seqs or self.pending, "no sequence fits in the KV cache"
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        if not self.async_scheduling:
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            finished = self.scheduler.postprocess(self.scheduler.commit(seqs, is_prefill), token_ids)
+        else:
+            # Launch this step before waiting for the previous one, so the GPU always has work queued
+            # while the CPU schedules and post-processes.
+            pending, self.pending = self.pending, None
+            if seqs:
+                output = self.model_runner.call("run_async", seqs, is_prefill)
+                self.pending = self.scheduler.commit(seqs, is_prefill), output
+            finished = []
+            if pending:
+                batch, output = pending
+                finished = self.scheduler.postprocess(batch, output.result())
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
         return outputs, num_tokens
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        return self.scheduler.is_finished() and self.pending is None
 
     def generate(
         self,
@@ -75,7 +90,7 @@ class LLMEngine:
             output, num_tokens = self.step()
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
+            elif num_tokens < 0:
                 decode_throughput = -num_tokens / (perf_counter() - t)
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",

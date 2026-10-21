@@ -8,10 +8,8 @@ def prefill(block_manager, seq):
     num_cached_blocks = block_manager.can_allocate(seq)
     assert num_cached_blocks != -1
     block_manager.allocate(seq, num_cached_blocks)
-    seq.num_scheduled_tokens = len(seq) - seq.num_cached_tokens
-    block_manager.hash_blocks(seq)
-    seq.num_cached_tokens += seq.num_scheduled_tokens
-    seq.num_scheduled_tokens = 0
+    block_manager.hash_blocks(seq, seq.num_cached_tokens, len(seq) - seq.num_cached_tokens)
+    seq.num_cached_tokens = len(seq)
     return num_cached_blocks
 
 

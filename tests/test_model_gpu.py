@@ -29,13 +29,14 @@ DOCUMENT = " ".join(f"Paragraph {i}: the scheduler batches requests, the block m
 DOCUMENT_QUESTIONS = ["Summarize the document in one sentence.", "Which component hands out KV cache blocks?"]
 
 
-@pytest.fixture(scope="module")
-def llm():
+@pytest.fixture(scope="module", params=[False, True], ids=["sync", "async"])
+def llm(request):
     if not os.path.isdir(MODEL):
         pytest.skip(f"no model at {MODEL}; set NANOVLLM_TEST_MODEL")
     from nanovllm import LLM
     # A small token budget sends the long prompts through chunked prefill.
-    engine = LLM(MODEL, max_model_len=4096, max_num_batched_tokens=1024, gpu_memory_utilization=0.5)
+    engine = LLM(MODEL, max_model_len=4096, max_num_batched_tokens=1024, gpu_memory_utilization=0.5,
+                 async_scheduling=request.param)
     yield engine
     engine.exit()
     atexit.unregister(engine.exit)

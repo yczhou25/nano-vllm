@@ -1,5 +1,6 @@
-"""Randomized engine simulation: the real Scheduler, BlockManager, Sequence and
-ModelRunner.prepare_prefill/prepare_decode, driven by a fake model instead of a GPU.
+"""Randomized engine simulation: the real LLMEngine.step, Scheduler, BlockManager, Sequence and
+ModelRunner.prepare_prefill/prepare_decode, driven by a fake model instead of a GPU, with and
+without async scheduling.
 
 For every position p of a sequence, the fake model writes prefix_hash(tokens[:p+1]) into a paged
 KV cache at the slot that slot_mapping gives, then "attends" by reading every context position
@@ -7,11 +8,15 @@ through block_tables and checks each value it reads. The next token is a functio
 hash, so each request has a reference output that does not depend on batching, chunked prefill,
 prefix caching or preemption, and the engine must reproduce it exactly.
 """
+import collections
 import hashlib
 import pickle
 import random
 import types
 
+import torch
+
+from nanovllm.engine.llm_engine import LLMEngine
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence
@@ -40,6 +45,15 @@ def make_runner(block_size, world_size=1, rank=0):
     runner.rank = rank
     runner.enforce_eager = True
     return runner
+
+
+def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False):
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens))
+    engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks)
+    engine.async_scheduling = async_scheduling
+    engine.pending = None
+    return engine
 
 
 def prefix_hashes(token_ids):
@@ -83,7 +97,18 @@ def prepare(runner, seqs, is_prefill):
     return meta
 
 
+class FakeOutput:
+
+    def __init__(self, token_ids):
+        self.token_ids = token_ids
+
+    def result(self):
+        return self.token_ids
+
+
 class FakeModel:
+    """Stands in for ModelRunner.call("run" / "run_async"). Like the GPU, it keeps the last step's
+    sampled tokens, which the real prepare_decode reads for tokens still in flight."""
 
     def __init__(self, scheduler: Scheduler, block_size: int, num_blocks: int, check_tp: bool = True):
         self.block_size = block_size
@@ -91,6 +116,17 @@ class FakeModel:
         self.runner = make_runner(block_size)
         self.block_manager = scheduler.block_manager
         self.check_tp = check_tp
+        self.last_outputs = {}
+        self.num_samples = collections.Counter()    # tokens sampled per seq, kept or not
+
+    def call(self, method_name, seqs, is_prefill):
+        token_ids = self.run(seqs, is_prefill)
+        for seq in seqs:
+            if not is_prefill or seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                self.num_samples[seq.seq_id] += 1
+        self.last_outputs = {seq.seq_id: t for seq, t in zip(seqs, token_ids)}
+        self.runner.last_token_ids = torch.tensor(token_ids, dtype=torch.int64)
+        return token_ids if method_name == "run" else FakeOutput(token_ids)
 
     def run(self, seqs, is_prefill):
         meta = prepare(self.runner, seqs, is_prefill)
@@ -114,6 +150,8 @@ class FakeModel:
             q0, q1 = cu_q[i], cu_q[i + 1]
             k_len = cu_k[i + 1] - cu_k[i]
             start = seq.num_cached_tokens
+            if seq.num_inflight:
+                raise Violation(f"seq {seq.seq_id}: prefill scheduled with a token in flight")
             truth = prefix_hashes(seq.token_ids[:k_len])
             if pos[q0:q1] != list(range(start, start + seq.num_scheduled_tokens)):
                 raise Violation(f"seq {seq.seq_id}: positions {pos[q0:q1]}, expected to start at {start}")
@@ -142,16 +180,24 @@ class FakeModel:
         bs = self.block_size
         ids, pos, slots = meta["input_ids"], meta["positions"], meta["slot_mapping"]
         context_lens, block_tables = meta["context_lens"], meta["block_tables"]
-        truths = [prefix_hashes(seq.token_ids) for seq in seqs]
+        truths = []
         for i, seq in enumerate(seqs):
+            token_ids = seq.token_ids
+            if seq.num_inflight:
+                if seq.num_inflight != 1 or ids[i] != self.last_outputs.get(seq.seq_id):
+                    raise Violation(f"seq {seq.seq_id}: in-flight input {ids[i]} is not the token sampled last step")
+                token_ids = token_ids + [ids[i]]
+            elif ids[i] != token_ids[-1]:
+                raise Violation(f"seq {seq.seq_id}: wrong decode input id")
             p = pos[i]
-            if p != len(seq) - 1 or ids[i] != seq.token_ids[-1] or context_lens[i] != len(seq):
-                raise Violation(f"seq {seq.seq_id}: wrong decode inputs pos={p} len={len(seq)} context_len={context_lens[i]}")
+            if p != len(token_ids) - 1 or context_lens[i] != len(token_ids):
+                raise Violation(f"seq {seq.seq_id}: wrong decode inputs pos={p} len={len(token_ids)} context_len={context_lens[i]}")
+            truths.append(prefix_hashes(token_ids))
             self._write(seq, p, slots[i], truths[i][p])
         for i, seq in enumerate(seqs):
             for p in range(context_lens[i]):
                 if self.kv[block_tables[i][p // bs] * bs + p % bs] != truths[i][p]:
-                    raise Violation(f"seq {seq.seq_id}: decode read wrong KV at position {p} (len {len(seq)})")
+                    raise Violation(f"seq {seq.seq_id}: decode read wrong KV at position {p} (context_len {context_lens[i]})")
         return [next_token(truths[i][-1]) for i in range(len(seqs))]
 
     def _write(self, seq, p, slot, value):
@@ -189,9 +235,10 @@ def check_block_manager(block_manager, live_seqs):
             raise Violation(f"hash_to_block_id maps {h} to block {block_id} with hash {block_manager.blocks[block_id].hash}")
 
 
-def run_engine(scheduler, model, requests, max_steps=50000):
+def run_engine(engine, requests, max_steps=50000):
     """Feed (arrival_step, prompt, sampling_params) requests to the engine, check the block manager
     after every step, and return {request index: completion token ids}."""
+    scheduler = engine.scheduler
     pending = sorted(range(len(requests)), key=lambda i: requests[i][0])
     seqs = {}
     outputs = {}
@@ -202,21 +249,24 @@ def run_engine(scheduler, model, requests, max_steps=50000):
             seq = Sequence(requests[i][1], requests[i][2])
             seqs[seq.seq_id] = (i, seq)
             scheduler.add(seq)
-        if scheduler.is_finished():
+        if engine.is_finished():
             if not pending:
                 break
             step += 1
             continue
-        batch, is_prefill = scheduler.schedule()
-        token_ids = model.run(batch, is_prefill)
-        scheduler.postprocess(batch, token_ids, is_prefill)
-        for seq in batch:
-            if seq.is_finished:
-                outputs[seqs[seq.seq_id][0]] = seq.completion_token_ids
+        for seq_id, token_ids in engine.step()[0]:
+            if seqs[seq_id][0] in outputs:
+                raise Violation(f"seq {seq_id} finished twice")
+            outputs[seqs[seq_id][0]] = token_ids
         check_block_manager(scheduler.block_manager, [s for s in [*scheduler.running, *scheduler.waiting] if s.block_table])
         for _, seq in seqs.values():
             if seq.num_completion_tokens > seq.max_tokens:
                 raise Violation(f"seq {seq.seq_id}: more than max_tokens completion tokens")
+            # Async scheduling may sample one token too many for a seq that hit EOS, never more.
+            in_flight = 0 if seq.is_finished else seq.num_inflight
+            wasted = engine.model_runner.num_samples[seq.seq_id] - seq.num_completion_tokens - in_flight
+            if wasted > (engine.async_scheduling and seq.is_finished and seq.num_completion_tokens < seq.max_tokens):
+                raise Violation(f"seq {seq.seq_id}: {wasted} sampled tokens thrown away")
         step += 1
         if step > max_steps:
             raise Violation("engine did not finish")
@@ -254,7 +304,7 @@ def random_requests(rng, block_size, capacity, pressure):
     return requests
 
 
-def run_random_case(seed):
+def run_random_case(seed, async_scheduling=False):
     rng = random.Random(seed)
     bs = rng.choice([2, 3, 4, 8])
     Sequence.block_size = bs
@@ -262,25 +312,23 @@ def run_random_case(seed):
     num_blocks = rng.randint(2, 10) if pressure else rng.randint(3, 40)
     max_num_seqs = rng.randint(1, 8)
     max_num_batched_tokens = max(1, rng.choice([1, 2, bs - 1, bs, bs + 1, 2 * bs, 3 * bs + 1, rng.randint(1, 10 * bs), 10 ** 6]))
-    scheduler = Scheduler(make_config(num_blocks, bs, max_num_seqs, max_num_batched_tokens))
-    model = FakeModel(scheduler, bs, num_blocks)
+    engine = make_engine(num_blocks, bs, max_num_seqs, max_num_batched_tokens, async_scheduling)
     requests = random_requests(rng, bs, num_blocks * bs, pressure)
-    outputs = run_engine(scheduler, model, requests)
+    outputs = run_engine(engine, requests)
     for i, (_, prompt, sp) in enumerate(requests):
         expected = reference(prompt, sp)
         if outputs.get(i) != expected:
             raise Violation(f"request {i}: output {outputs.get(i)} != reference {expected}")
 
 
-def run_random_case_block_256(seed):
+def run_random_case_block_256(seed, async_scheduling=False):
     """Same checks with the default block size and realistic token budgets."""
     rng = random.Random(seed)
     bs = 256
     Sequence.block_size = bs
     num_blocks = rng.randint(4, 16)
     max_num_batched_tokens = rng.choice([256, 300, 511, 512, 1000, 16384])
-    scheduler = Scheduler(make_config(num_blocks, bs, rng.randint(1, 6), max_num_batched_tokens))
-    model = FakeModel(scheduler, bs, num_blocks)
+    engine = make_engine(num_blocks, bs, rng.randint(1, 6), max_num_batched_tokens, async_scheduling)
     base = [rng.randrange(1, VOCAB) for _ in range(1200)]
     requests = []
     for _ in range(rng.randint(2, 6)):
@@ -291,7 +339,7 @@ def run_random_case_block_256(seed):
             max_tokens = max(1, num_blocks * bs - len(prompt))
             prompt = prompt[:num_blocks * bs - max_tokens]
         requests.append((0, prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=rng.random() < 0.7)))
-    outputs = run_engine(scheduler, model, requests)
+    outputs = run_engine(engine, requests)
     for i, (_, prompt, sp) in enumerate(requests):
         if outputs.get(i) != reference(prompt, sp):
             raise Violation(f"request {i}: output differs from reference")

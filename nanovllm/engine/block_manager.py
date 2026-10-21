@@ -101,15 +101,14 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return len(self.free_block_ids) >= ((len(seq) + seq.num_inflight) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+        if (len(seq) + seq.num_inflight) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
-    def hash_blocks(self, seq: Sequence):
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+    def hash_blocks(self, seq: Sequence, start: int, num_tokens: int):
+        start, end = start // self.block_size, (start + num_tokens) // self.block_size
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):

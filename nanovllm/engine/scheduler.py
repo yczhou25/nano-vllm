@@ -55,8 +55,12 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
+        kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            if seq.num_completion_tokens + seq.num_inflight == seq.max_tokens:    # last token is in flight
+                kept_seqs.append(seq)
+                continue
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -68,8 +72,8 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
+                kept_seqs.append(seq)
+        self.running.extendleft(reversed(kept_seqs))
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
@@ -78,15 +82,38 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):
-            self.block_manager.hash_blocks(seq)
-            seq.num_cached_tokens += seq.num_scheduled_tokens
+    def commit(self, seqs: list[Sequence], is_prefill: bool) -> list[tuple[Sequence, int, int, bool]]:
+        """Advance sequences past a step that has been launched. Its sampled tokens stay in flight
+        until postprocess, so with async scheduling the next step can be scheduled first."""
+        batch = []
+        for row, seq in enumerate(seqs):
+            start, num_tokens = seq.num_cached_tokens, seq.num_scheduled_tokens
+            seq.num_cached_tokens += num_tokens
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            samples = not is_prefill or seq.num_cached_tokens == seq.num_tokens
+            if samples:
+                seq.num_inflight += 1
+                seq.inflight_row = row
+            batch.append((seq, start, num_tokens, samples))
+        return batch
+
+    def postprocess(self, batch: list[tuple[Sequence, int, int, bool]], token_ids: list[int]) -> list[Sequence]:
+        finished = []
+        for (seq, start, num_tokens, samples), token_id in zip(batch, token_ids):
+            if seq.is_finished:    # finished while this step was in flight
                 continue
+            if seq.block_table:    # empty if preempted while this step was in flight
+                self.block_manager.hash_blocks(seq, start, num_tokens)
+            if not samples:
+                continue
+            seq.num_inflight -= 1
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                if seq.status == SequenceStatus.RUNNING:
+                    self.running.remove(seq)
+                else:
+                    self.waiting.remove(seq)
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                finished.append(seq)
+        return finished

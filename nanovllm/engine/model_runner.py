@@ -12,6 +12,19 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
+class AsyncOutput:
+
+    def __init__(self, token_ids: torch.Tensor):
+        self.token_ids = torch.empty(token_ids.shape, dtype=token_ids.dtype, pin_memory=True)
+        self.token_ids.copy_(token_ids, non_blocking=True)
+        self.event = torch.cuda.Event()
+        self.event.record()
+
+    def result(self) -> list[int]:
+        self.event.synchronize()
+        return self.token_ids.tolist()
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -22,6 +35,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.last_token_ids = None    # last run_async step's sampled tokens, still on the GPU
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -75,6 +89,9 @@ class ModelRunner:
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
+        for event in self.event:
+            while event.is_set():    # with async scheduling a worker may not have read the last call yet
+                pass
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
@@ -171,15 +188,22 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
+        inflight_rows = []
         positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + (len(seq) - 1) % self.block_size)
+            # With async scheduling the newest token may still be on the GPU, in the last step's output.
+            seq_len = len(seq) + seq.num_inflight
+            input_ids.append(0 if seq.num_inflight else seq.last_token)
+            inflight_rows.append(seq.inflight_row if seq.num_inflight else -1)
+            positions.append(seq_len - 1)
+            context_lens.append(seq_len)
+            slot_mapping.append(seq.block_table[-1] * self.block_size + (seq_len - 1) % self.block_size)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if any(row >= 0 for row in inflight_rows):
+            inflight_rows = torch.tensor(inflight_rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            input_ids = torch.where(inflight_rows >= 0, self.last_token_ids[inflight_rows.clamp_min(0)], input_ids)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -218,6 +242,22 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def run_async(self, seqs: list[Sequence], is_prefill: bool) -> "AsyncOutput | None":
+        """Like run, but returns before the GPU finishes. The sampled tokens stay on the GPU as
+        inputs for the next decode step, and are copied to the host in the background."""
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, is_prefill)
+        if self.rank == 0:
+            token_ids = self.sampler(logits, temperatures)
+        else:
+            token_ids = torch.empty(len(seqs), dtype=torch.int64, device="cuda")
+        if self.world_size > 1:
+            dist.broadcast(token_ids, 0)    # every rank needs them as next-step inputs
+        self.last_token_ids = token_ids
+        reset_context()
+        return AsyncOutput(token_ids) if self.rank == 0 else None
 
     @torch.inference_mode()
     def capture_cudagraph(self):

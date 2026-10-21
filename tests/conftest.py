@@ -1,40 +1,11 @@
 import os
 import sys
-import types
 
 import pytest
-import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-HAS_CUDA = torch.cuda.is_available()
-
-
-def _stub_module(name, **attrs):
-    module = types.ModuleType(name)
-    module.__dict__.update(attrs)
-    sys.modules[name] = module
-
-
-# The scheduler, block manager and input preparation are plain Python. Without a GPU, make the
-# GPU-only imports and host-to-device copies no-ops so those parts can still be tested on CPU.
-if not HAS_CUDA:
-    import torch._dynamo
-    torch._dynamo.config.disable = True
-
-    try:
-        import flash_attn, triton  # noqa: F401
-    except ImportError:
-        # layers/attention.py is the only module that needs them, for the GPU kernels.
-        _stub_module("nanovllm.layers.attention", Attention=None)
-
-    _tensor = torch.tensor
-
-    def _tensor_no_pin(*args, pin_memory=False, **kwargs):
-        return _tensor(*args, **kwargs)
-
-    torch.tensor = _tensor_no_pin
-    torch.Tensor.cuda = lambda self, *args, **kwargs: self
+from cpu_shims import HAS_CUDA  # noqa: E402  (must run before nanovllm is imported)
 
 
 def pytest_configure(config):
