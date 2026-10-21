@@ -43,6 +43,16 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Tests
+
+```bash
+pip install pytest
+pytest              # scheduler, block manager, input preparation and sampler; runs on CPU
+NANOVLLM_TEST_MODEL=~/huggingface/Qwen3-0.6B/ pytest -m gpu     # greedy outputs vs. transformers
+```
+
+`tests/engine_sim.py` drives the real scheduler, block manager and input preparation with a fake model that checks every KV cache write and read, across chunked prefill, prefix caching and preemption. Set `NANOVLLM_SIM_CASES` to run more random cases.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
