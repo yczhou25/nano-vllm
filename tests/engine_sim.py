@@ -233,11 +233,13 @@ class FakeModel:
         if q == 1:
             return [t[0] for t in targets]
         # A target model that is certain of each next token, verified by the real rejection sampler
-        # with the draft tokens taken from the inputs, as ModelRunner.run does.
-        logits = torch.full((len(ids), VOCAB), -1000.0)
+        # (compiled, on the GPU if there is one) with the draft tokens taken from the inputs, as
+        # ModelRunner.run does.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logits = torch.full((len(ids), VOCAB), -1000.0, device=device)
         logits[torch.arange(len(ids)), torch.tensor(sum(targets, []))] = 0.0
-        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32)
-        draft_token_ids = torch.tensor(ids, dtype=torch.int64).view(len(seqs), q)[:, 1:]
+        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=device)
+        draft_token_ids = torch.tensor(ids, dtype=torch.int64, device=device).view(len(seqs), q)[:, 1:]
         token_ids = accepted_token_ids(self.rejection_sampler(logits, temperatures, draft_token_ids).tolist())
         for i, seq in enumerate(seqs):
             accepted = next(j for j in range(q) if j == q - 1 or seq.draft_token_ids[j] != targets[i][j])
