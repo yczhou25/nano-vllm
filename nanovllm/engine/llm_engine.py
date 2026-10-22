@@ -54,6 +54,8 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         if not self.async_scheduling:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
+            if not is_prefill and self.scheduler.num_speculative_tokens:
+                num_tokens = -sum(map(len, token_ids))
             finished = self.scheduler.postprocess(self.scheduler.commit(seqs, is_prefill), token_ids)
         else:
             # Launch this step before waiting for the previous one, so the GPU always has work queued

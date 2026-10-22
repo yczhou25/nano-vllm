@@ -45,6 +45,8 @@ outputs[0]["text"]
 
 Pass `async_scheduling=True` to `LLM` to schedule the next step while the GPU runs the current one (experimental).
 
+Pass `num_speculative_tokens=k` to `LLM` for speculative decoding with n-gram (prompt lookup) drafts: each decode step proposes `k` tokens from earlier text and checks them in one forward pass (experimental, not combined with `async_scheduling` yet). Outputs follow the same distribution as without it.
+
 ## Tests
 
 ```bash

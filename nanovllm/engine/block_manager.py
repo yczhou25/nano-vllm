@@ -100,11 +100,17 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= ((len(seq) + seq.num_inflight) % self.block_size == 1)
+    def num_new_blocks(self, seq: Sequence, num_tokens: int) -> int:
+        # A decode step writes the KV of the newest token (which may be in flight) and of num_tokens - 1
+        # draft tokens after it.
+        num_blocks = (len(seq) + seq.num_inflight - 1 + num_tokens + self.block_size - 1) // self.block_size
+        return num_blocks - len(seq.block_table)
 
-    def may_append(self, seq: Sequence):
-        if (len(seq) + seq.num_inflight) % self.block_size == 1:
+    def can_append(self, seq: Sequence, num_tokens: int = 1) -> bool:
+        return len(self.free_block_ids) >= self.num_new_blocks(seq, num_tokens)
+
+    def may_append(self, seq: Sequence, num_tokens: int = 1):
+        for _ in range(self.num_new_blocks(seq, num_tokens)):
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, start: int, num_tokens: int):

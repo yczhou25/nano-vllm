@@ -29,14 +29,21 @@ DOCUMENT = " ".join(f"Paragraph {i}: the scheduler batches requests, the block m
 DOCUMENT_QUESTIONS = ["Summarize the document in one sentence.", "Which component hands out KV cache blocks?"]
 
 
-@pytest.fixture(scope="module", params=[False, True], ids=["sync", "async"])
+ENGINE_OPTIONS = {
+    "sync": {},
+    "async": {"async_scheduling": True},
+    "spec": {"num_speculative_tokens": 4},
+}
+
+
+@pytest.fixture(scope="module", params=list(ENGINE_OPTIONS))
 def llm(request):
     if not os.path.isdir(MODEL):
         pytest.skip(f"no model at {MODEL}; set NANOVLLM_TEST_MODEL")
     from nanovllm import LLM
     # A small token budget sends the long prompts through chunked prefill.
     engine = LLM(MODEL, max_model_len=4096, max_num_batched_tokens=1024, gpu_memory_utilization=0.5,
-                 async_scheduling=request.param)
+                 **ENGINE_OPTIONS[request.param])
     yield engine
     engine.exit()
     atexit.unregister(engine.exit)
@@ -85,3 +92,10 @@ def test_chunked_prefill_and_prefix_cache_match_reference(llm, reference):
     for prompt, a, b in zip(prompts, first, second):
         check(reference, prompt, a)
         check(reference, prompt, b)
+
+
+def test_sampling_returns_max_tokens(llm):
+    from nanovllm import SamplingParams
+    prompts = [chat(llm.tokenizer, q) for q in QUESTIONS]
+    outputs = llm.generate(prompts, SamplingParams(temperature=0.8, max_tokens=MAX_TOKENS, ignore_eos=True), use_tqdm=False)
+    assert [len(output["token_ids"]) for output in outputs] == [MAX_TOKENS] * len(prompts)

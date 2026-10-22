@@ -3,6 +3,7 @@ from collections import deque
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.ngram import NgramProposer
 
 
 class Scheduler:
@@ -13,6 +14,9 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.num_speculative_tokens = config.num_speculative_tokens
+        self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens else None
+        self.num_draft_tokens = self.num_accepted_tokens = 0    # speculative decoding statistics
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -55,22 +59,25 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
+        num_decode_tokens = 1 + self.num_speculative_tokens
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             if seq.num_completion_tokens + seq.num_inflight == seq.max_tokens:    # last token is in flight
                 kept_seqs.append(seq)
                 continue
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, num_decode_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
                     break
             else:
-                seq.num_scheduled_tokens = 1
+                seq.num_scheduled_tokens = num_decode_tokens
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                if self.proposer:
+                    seq.draft_token_ids = self.proposer.propose(seq)
+                self.block_manager.may_append(seq, num_decode_tokens)
                 scheduled_seqs.append(seq)
                 kept_seqs.append(seq)
         self.running.extendleft(reversed(kept_seqs))
@@ -97,23 +104,39 @@ class Scheduler:
             batch.append((seq, start, num_tokens, samples))
         return batch
 
-    def postprocess(self, batch: list[tuple[Sequence, int, int, bool]], token_ids: list[int]) -> list[Sequence]:
+    def postprocess(self, batch: list[tuple[Sequence, int, int, bool]], token_ids: list[int] | list[list[int]]) -> list[Sequence]:
+        """token_ids has one token per sequence, or with speculative decoding, a list per decoded
+        sequence: its accepted draft tokens followed by one sampled token."""
         finished = []
-        for (seq, start, num_tokens, samples), token_id in zip(batch, token_ids):
+        for (seq, start, num_tokens, samples), new_token_ids in zip(batch, token_ids):
             if seq.is_finished:    # finished while this step was in flight
                 continue
+            stop = False
+            if samples:
+                seq.num_inflight -= 1
+                speculative = isinstance(new_token_ids, list)
+                for token_id in new_token_ids if speculative else [new_token_ids]:
+                    seq.append_token(token_id)
+                    stop = (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
+                    if stop:
+                        break
+                if speculative:
+                    self.num_draft_tokens += self.num_speculative_tokens
+                    self.num_accepted_tokens += len(new_token_ids) - 1
+                    # Only the KV of the input token and the accepted drafts is valid; later steps
+                    # overwrite the rest.
+                    num_tokens = seq.num_tokens - start - 1
+                    seq.num_cached_tokens = start + num_tokens
             if seq.block_table:    # empty if preempted while this step was in flight
                 self.block_manager.hash_blocks(seq, start, num_tokens)
-            if not samples:
-                continue
-            seq.num_inflight -= 1
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if stop:
                 if seq.status == SequenceStatus.RUNNING:
                     self.running.remove(seq)
                 else:
                     self.waiting.remove(seq)
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
+                if self.proposer:
+                    self.proposer.forget(seq)
                 finished.append(seq)
         return finished
