@@ -26,7 +26,8 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.num_inflight = 0       # tokens sampled on the GPU but not appended yet (async scheduling)
         self.inflight_row = -1      # row of the newest in-flight token in the last step's output
-        self.draft_token_ids = []   # tokens proposed for this decode step (speculative decoding)
+        self.draft_token_ids = []   # tokens proposed for this decode step (speculative decoding with n-gram drafts)
+        self.draft_cache_lags = False   # the draft model's KV cache lacks the newest cached token (see Scheduler.postprocess)
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -76,14 +77,13 @@ class Sequence:
         if self.is_prefill:
             last_state = self.token_ids[self.num_cached_tokens:self.num_cached_tokens + self.num_scheduled_tokens]
         else:
-            last_state = self.last_token
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, last_state)
+            last_state = tuple(self.token_ids[-2:])    # a draft model scores the last two tokens
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, self.draft_cache_lags, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, last_state = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, self.draft_cache_lags, last_state = state
         if isinstance(last_state, list):
             self.token_ids = [0] * self.num_cached_tokens + last_state
-            self.last_token = self.token_ids[-1]
         else:
-            self.token_ids = []
-            self.last_token = last_state
+            self.token_ids = [0] * (self.num_tokens - len(last_state)) + list(last_state)
+        self.last_token = self.token_ids[-1]

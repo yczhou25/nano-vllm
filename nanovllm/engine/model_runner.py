@@ -8,7 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler, RejectionSampler, accepted_token_ids
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, restore_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
@@ -37,6 +37,8 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.last_token_ids = None    # last run_async step's sampled tokens, still on the GPU
+        self.draft_model = None
+        self.draft_inputs = None      # the draft model's decode inputs, prepared with the target's
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -45,6 +47,9 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        if config.speculative_model is not None:
+            self.draft_model = Qwen3ForCausalLM(config.draft_hf_config)
+            load_model(self.draft_model, config.speculative_model)
         self.sampler = Sampler()
         self.rejection_sampler = RejectionSampler()
         self.warmup_model()
@@ -70,7 +75,7 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.graphs, self.draft_graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -119,25 +124,38 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
+    def kv_cache_block_bytes(self, hf_config) -> int:
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        return 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+
+    def bind_kv_cache(self, model: Qwen3ForCausalLM, hf_config, num_blocks: int) -> torch.Tensor:
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_blocks, self.block_size, num_kv_heads, head_dim)
+        layer_id = 0
+        for module in model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = kv_cache[0, layer_id]
+                module.v_cache = kv_cache[1, layer_id]
+                layer_id += 1
+        return kv_cache
+
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # The draft model keeps its own KV cache, with the same block ids as the target's.
+        block_bytes = self.kv_cache_block_bytes(config.hf_config)
+        if self.draft_model is not None:
+            block_bytes += self.kv_cache_block_bytes(config.draft_hf_config)
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        self.kv_cache = self.bind_kv_cache(self.model, config.hf_config, config.num_kvcache_blocks)
+        if self.draft_model is not None:
+            self.draft_kv_cache = self.bind_kv_cache(self.draft_model, config.draft_hf_config, config.num_kvcache_blocks)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -194,17 +212,28 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        draft_input_ids = []
+        draft_slot_mapping = []
+        k = self.num_speculative_tokens
         for seq in seqs:
             # With async scheduling the newest token may still be on the GPU, in the last step's output.
             # With speculative decoding the draft tokens follow it, and all of them are scored at once.
             seq_len = len(seq) + seq.num_inflight
             input_ids.append(0 if seq.num_inflight else seq.last_token)
-            input_ids.extend(seq.draft_token_ids)
+            input_ids.extend(seq.draft_token_ids if self.draft_model is None else [0] * k)    # propose fills these in
             inflight_rows.append(seq.inflight_row if seq.num_inflight else -1)
-            for position in range(seq_len - 1, seq_len + len(seq.draft_token_ids)):
+            for position in range(seq_len - 1, seq_len + k):
                 positions.append(position)
                 slot_mapping.append(seq.block_table[position // self.block_size] * self.block_size + position % self.block_size)
             context_lens.append(positions[-1] + 1)
+            if self.draft_model is not None:
+                # The draft model first scores the last two tokens at positions seq_len - 2 and
+                # seq_len - 1, then each draft it produces. The second-to-last token is usually in
+                # its KV cache already; its slot is masked then so that no hashed block is written.
+                position = seq_len - 2
+                draft_input_ids.append(seq.token_ids[-2:])
+                draft_slot_mapping.append(seq.block_table[position // self.block_size] * self.block_size + position % self.block_size if seq.draft_cache_lags else -1)
+                draft_slot_mapping.extend(slot_mapping[-k - 1:-1])
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         if any(row >= 0 for row in inflight_rows):
             inflight_rows = torch.tensor(inflight_rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -213,6 +242,10 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        if self.draft_model is not None:
+            draft_input_ids = torch.tensor(draft_input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            draft_slot_mapping = torch.tensor(draft_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True).view(len(seqs), k + 1)
+            self.draft_inputs = draft_input_ids, positions.view(len(seqs), k + 1) - 1, draft_slot_mapping
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -222,14 +255,16 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def forward(self, model: Qwen3ForCausalLM, graphs: dict | None, outputs: torch.Tensor | None, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        """Hidden states of input_ids, through a captured CUDA graph when there is one for this
+        decode batch size."""
         context = get_context()
         if is_prefill or self.enforce_eager or context.context_lens.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return model(input_ids, positions)
         else:
             bs = context.context_lens.size(0)
-            n = input_ids.size(0)    # bs * (num_speculative_tokens + 1)
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            n = input_ids.size(0)    # bs * tokens per sequence
+            graph = graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:n] = input_ids
             graph_vars["positions"][:n] = positions
@@ -239,12 +274,46 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:n])
+            return outputs[:n]
+
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        graphs, outputs = (self.graphs, self.graph_vars["outputs"]) if not self.enforce_eager else (None, None)
+        return self.model.compute_logits(self.forward(self.model, graphs, outputs, input_ids, positions, is_prefill))
+
+    @torch.inference_mode()
+    def propose(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Run the draft model num_speculative_tokens times and write its greedy tokens into the
+        draft columns of input_ids (one row of batch_size * (k + 1)). The proposals are
+        deterministic given the context, so RejectionSampler stays exact."""
+        k = self.num_speculative_tokens
+        context = get_context()    # the target's
+        context_lens, block_tables = context.context_lens, context.block_tables
+        draft_input_ids, draft_positions, draft_slot_mapping = self.draft_inputs
+        bs = draft_input_ids.size(0)
+        input_ids = input_ids.view(bs, k + 1)
+        tokens = draft_input_ids.view(-1)
+        for i in range(k):
+            cols = slice(0, 2) if i == 0 else slice(i + 1, i + 2)
+            q = cols.stop - cols.start    # tokens per sequence in this draft step
+            set_context(False, slot_mapping=draft_slot_mapping[:, cols].reshape(-1), context_lens=context_lens - k + i, block_tables=block_tables)
+            graphs, outputs = (self.draft_graphs[q], self.graph_vars["draft_outputs"]) if not self.enforce_eager else (None, None)
+            hidden_states = self.forward(self.draft_model, graphs, outputs, tokens, draft_positions[:, cols].reshape(-1), False)
+            logits = self.draft_model.compute_logits(hidden_states[q - 1::q])
+            tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")
+            if self.world_size > 1:
+                dist.broadcast(tokens, 0)
+            input_ids[:, i + 1] = tokens
+        restore_context(context)
+        return input_ids.view(-1)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if self.draft_model is not None and not is_prefill:
+            input_ids = self.propose(input_ids)
         logits = self.run_model(input_ids, positions, is_prefill)
+        if self.draft_model is not None and is_prefill:
+            self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
         token_ids = None
         if self.rank == 0 and (is_prefill or not self.num_speculative_tokens):
             token_ids = self.sampler(logits, temperatures).tolist()
@@ -271,40 +340,46 @@ class ModelRunner:
         return AsyncOutput(token_ids) if self.rank == 0 else None
 
     @torch.inference_mode()
+    def capture_graphs(self, model: Qwen3ForCausalLM, outputs: torch.Tensor, q: int) -> dict[int, torch.cuda.CUDAGraph]:
+        """One graph per batch size for decode steps of q tokens per sequence. All graphs share
+        the input buffers in graph_vars and the memory pool; they are replayed one at a time."""
+        graph_vars = self.graph_vars
+        input_ids, positions = graph_vars["input_ids"], graph_vars["positions"]
+        graphs = {}
+        for bs in reversed(self.graph_bs):
+            graph = torch.cuda.CUDAGraph()
+            n = bs * q
+            set_context(False, slot_mapping=graph_vars["slot_mapping"][:n], context_lens=graph_vars["context_lens"][:bs], block_tables=graph_vars["block_tables"][:bs])
+            outputs[:n] = model(input_ids[:n], positions[:n])    # warmup
+            with torch.cuda.graph(graph, self.graph_pool):
+                outputs[:n] = model(input_ids[:n], positions[:n])    # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+        return graphs
+
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         q = 1 + self.num_speculative_tokens    # tokens per sequence in a decode step
         max_num_blocks = (config.max_model_len + q - 1 + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs * q, dtype=torch.int64)
-        positions = torch.zeros(max_bs * q, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs * q, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs * q, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
         self.graph_pool = None
-
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            n = bs * q
-            set_context(False, slot_mapping=slot_mapping[:n], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:n] = self.model(input_ids[:n], positions[:n])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:n] = self.model(input_ids[:n], positions[:n])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
-
         self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
+            input_ids=torch.zeros(max_bs * q, dtype=torch.int64),
+            positions=torch.zeros(max_bs * q, dtype=torch.int64),
+            slot_mapping=torch.zeros(max_bs * q, dtype=torch.int32),
+            context_lens=torch.zeros(max_bs, dtype=torch.int32),
+            block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32),
+            outputs=torch.zeros(max_bs * q, hf_config.hidden_size),
         )
+        self.graphs = self.capture_graphs(self.model, self.graph_vars["outputs"], q)
+        self.draft_graphs = {}
+        if self.draft_model is not None:
+            # The first draft step scores two tokens per sequence, the others one (see propose).
+            self.graph_vars["draft_outputs"] = torch.zeros(max_bs * 2, config.draft_hf_config.hidden_size)
+            for q in (2, 1):
+                self.draft_graphs[q] = self.capture_graphs(self.draft_model, self.graph_vars["draft_outputs"], q)

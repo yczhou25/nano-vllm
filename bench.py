@@ -15,11 +15,12 @@ def main():
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
+    parser.add_argument("--speculative-model", default=None)
     args = parser.parse_args()
 
     seed(0)
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling,
-              num_speculative_tokens=args.num_speculative_tokens)
+              num_speculative_tokens=args.num_speculative_tokens, speculative_model=args.speculative_model)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, args.max_input_len))] for _ in range(args.num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, args.max_output_len)) for _ in range(args.num_seqs)]

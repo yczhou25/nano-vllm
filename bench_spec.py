@@ -1,4 +1,5 @@
-"""Speculative decoding benchmark: throughput and draft acceptance with and without n-gram drafts.
+"""Speculative decoding benchmark: throughput and draft acceptance without drafts, with n-gram
+drafts, and with a draft model (--speculative-model).
 
 The "edit" workload asks the model to return a source file with docstrings added, so most of the
 output repeats the prompt (where prompt lookup helps); the "chat" workload asks open questions.
@@ -41,6 +42,7 @@ def main():
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     parser.add_argument("--workload", choices=["edit", "chat"], default="edit")
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
+    parser.add_argument("--speculative-model", default=None, help="draft model directory; n-gram drafts if omitted")
     parser.add_argument("--batch-size", type=int, default=1, help="requests per generate call")
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--max-prompt-tokens", type=int, default=2048)
@@ -49,7 +51,8 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     args = parser.parse_args()
 
-    llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, num_speculative_tokens=args.num_speculative_tokens)
+    llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, num_speculative_tokens=args.num_speculative_tokens,
+              speculative_model=args.speculative_model)
     prompts = build_prompts(llm.tokenizer, args.workload, args.num_prompts, args.max_prompt_tokens)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
     llm.generate(prompts[:1], SamplingParams(max_tokens=16), use_tqdm=False)    # warmup
@@ -63,7 +66,8 @@ def main():
         num_tokens += sum(len(output["token_ids"]) for output in outputs)
     t = time.perf_counter() - t
     acceptance = scheduler.num_accepted_tokens / scheduler.num_draft_tokens if scheduler.num_draft_tokens else 0.0
-    print(f"workload={args.workload} k={args.num_speculative_tokens} batch={args.batch_size} T={args.temperature} "
+    drafter = "none" if not args.num_speculative_tokens else "model" if args.speculative_model else "ngram"
+    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} batch={args.batch_size} T={args.temperature} "
           f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f}")
 
 

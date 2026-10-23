@@ -15,7 +15,8 @@ class Scheduler:
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.num_speculative_tokens = config.num_speculative_tokens
-        self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens else None
+        self.has_draft_model = config.speculative_model is not None    # the model runner drafts on the GPU
+        self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens and not self.has_draft_model else None
         self.num_draft_tokens = self.num_accepted_tokens = 0    # speculative decoding statistics
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -86,6 +87,7 @@ class Scheduler:
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
+        seq.draft_cache_lags = False    # the prefill rebuilds both KV caches
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
@@ -127,8 +129,15 @@ class Scheduler:
                     # overwrite the rest.
                     num_tokens = seq.num_tokens - start - 1
                     seq.num_cached_tokens = start + num_tokens
+                    # The draft model scores every draft but the last one, so when all of them are
+                    # accepted its KV cache lacks the newest cached token. The next step's draft
+                    # inputs fill it in (ModelRunner.prepare_decode); until then that token's
+                    # block must not be hashed, or a prefix cache hit would read a stale draft KV.
+                    seq.draft_cache_lags = self.has_draft_model and len(new_token_ids) == self.num_speculative_tokens + 1
+                else:
+                    seq.draft_cache_lags = False
             if seq.block_table:    # empty if preempted while this step was in flight
-                self.block_manager.hash_blocks(seq, start, num_tokens)
+                self.block_manager.hash_blocks(seq, start, num_tokens - seq.draft_cache_lags)
             if stop:
                 if seq.status == SequenceStatus.RUNNING:
                     self.running.remove(seq)

@@ -115,7 +115,10 @@ class BlockManager:
 
     def hash_blocks(self, seq: Sequence, start: int, num_tokens: int):
         start, end = start // self.block_size, (start + num_tokens) // self.block_size
-        if start == end: return
+        # A full block may have been left for later (a draft model's KV cache can lag a step behind).
+        while start > 0 and self.blocks[seq.block_table[start - 1]].hash == -1:
+            start -= 1
+        if start >= end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]

@@ -15,6 +15,8 @@ from nanovllm.engine.sequence import Sequence
 pytestmark = pytest.mark.gpu
 
 MODEL = os.path.expanduser(os.environ.get("NANOVLLM_TEST_MODEL", "~/huggingface/Qwen3-0.6B/"))
+# The draft model defaults to the target itself, whose greedy drafts should nearly all be accepted.
+DRAFT_MODEL = os.path.expanduser(os.environ.get("NANOVLLM_TEST_DRAFT_MODEL", MODEL))
 LOGIT_TOL = float(os.environ.get("NANOVLLM_TEST_LOGIT_TOL", "0.5"))
 MAX_TOKENS = 64
 
@@ -33,6 +35,7 @@ ENGINE_OPTIONS = {
     "sync": {},
     "async": {"async_scheduling": True},
     "spec": {"num_speculative_tokens": 4},
+    "draft": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL},
 }
 
 
@@ -77,9 +80,15 @@ def generate(llm, prompts):
 
 def test_greedy_matches_reference(llm, reference):
     prompts = [chat(llm.tokenizer, q) for q in QUESTIONS]
+    scheduler = llm.scheduler
+    scheduler.num_draft_tokens = scheduler.num_accepted_tokens = 0
     for prompt, completion in zip(prompts, generate(llm, prompts)):
         assert completion
         check(reference, prompt, completion)
+    if scheduler.has_draft_model and os.path.samefile(DRAFT_MODEL, MODEL):
+        # The target drafting for itself: every draft matches the greedy token unless bf16 noise
+        # between the draft and verification passes flips a near-tie.
+        assert scheduler.num_accepted_tokens / scheduler.num_draft_tokens > 0.8
 
 
 def test_chunked_prefill_and_prefix_cache_match_reference(llm, reference):
