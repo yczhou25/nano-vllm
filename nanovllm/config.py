@@ -15,6 +15,7 @@ class Config:
     async_scheduling: bool = False
     num_speculative_tokens: int = 0
     speculative_model: str | None = None    # a smaller model that drafts the speculative tokens; n-gram lookup if None
+    speculative_disable_by_batch_size: int | None = None    # decode without drafts while more sequences than this are running
     hf_config: AutoConfig | None = None
     draft_hf_config: AutoConfig | None = None
     eos: int = -1
@@ -28,6 +29,7 @@ class Config:
         assert self.num_speculative_tokens >= 0
         assert not (self.async_scheduling and self.num_speculative_tokens and self.speculative_model is None), \
             "n-gram drafts need the sampled tokens on the CPU; with async scheduling use a draft model (speculative_model)"
+        assert self.speculative_disable_by_batch_size is None or (self.num_speculative_tokens and self.speculative_disable_by_batch_size >= 1)
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if self.speculative_model is not None:

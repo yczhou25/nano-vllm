@@ -5,9 +5,10 @@ import pytest
 from engine_sim import run_random_case, run_random_case_block_256
 
 NUM_CASES = int(os.environ.get("NANOVLLM_SIM_CASES", "300"))
-# (async_scheduling, num_speculative_tokens, draft_model)
-MODES = {"sync": (False, 0, False), "async": (True, 0, False), "spec1": (False, 1, False), "spec4": (False, 4, False),
-         "draft1": (False, 1, True), "draft4": (False, 4, True), "async_draft1": (True, 1, True), "async_draft4": (True, 4, True)}
+# (async_scheduling, num_speculative_tokens, draft_model, adaptive: drafts switched off for larger batches)
+MODES = {"sync": (False, 0, False, False), "async": (True, 0, False, False), "spec1": (False, 1, False, False), "spec4": (False, 4, False, False),
+         "draft1": (False, 1, True, False), "draft4": (False, 4, True, False), "async_draft1": (True, 1, True, False), "async_draft4": (True, 4, True, False),
+         "spec4_adaptive": (False, 4, False, True), "draft4_adaptive": (False, 4, True, True), "async_draft4_adaptive": (True, 4, True, True)}
 
 
 @pytest.mark.parametrize("mode", MODES)

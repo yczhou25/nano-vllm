@@ -18,6 +18,7 @@
 | N-gram speculative decoding | `nanovllm/engine/ngram.py`, `model_runner.py` | Prompt-lookup drafts: propose `k` tokens from earlier text, verify them in one forward pass. `LLM(..., num_speculative_tokens=k)` |
 | Draft-model speculative decoding | `nanovllm/engine/model_runner.py`, `block_manager.py` | A smaller model of the same family drafts; it keeps its own KV cache and block tables. `LLM(..., speculative_model=PATH)`; combines with `async_scheduling` |
 | Rejection sampling | `nanovllm/layers/sampler.py` | Accept/reject drafts so outputs follow the target model's distribution; greedy with `temperature=0` |
+| Adaptive speculation | `nanovllm/engine/scheduler.py`, `model_runner.py` | `LLM(..., speculative_disable_by_batch_size=n)`: decode steps run without drafts while more than `n` sequences are running, where the GPU is busy anyway; the draft model's KV cache is kept current so drafting resumes at any step |
 | Tensor-parallel fixes | `sequence.py`, `model_runner.py` | Decode slot mapping used the model's block size instead of the runner's; prefill sent unscheduled tokens to TP workers (both found by auditing the code) |
 | Test suite + CI | `tests/`, `.github/workflows/tests.yml` | Runs on CPU with stubs for flash-attn and triton; GPU tests compare greedy outputs with `transformers` |
 
@@ -42,7 +43,7 @@ outputs = llm.generate(["Hello, nano-vllm."], SamplingParams(temperature=0.6, ma
 print(outputs[0]["text"])
 ```
 
-Drop `speculative_model` to draft with n-grams instead (n-gram drafts do not combine with `async_scheduling`). Without either option the engine behaves like upstream nano-vllm.
+Drop `speculative_model` to draft with n-grams instead (n-gram drafts do not combine with `async_scheduling`). Add `speculative_disable_by_batch_size=8` to speculate only for small batches. Without any of these options the engine behaves like upstream nano-vllm.
 
 ## Tests
 

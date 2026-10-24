@@ -50,9 +50,10 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--async-scheduling", action="store_true")
+    parser.add_argument("--speculative-disable-by-batch-size", type=int, default=None, help="decode without drafts while more sequences than this are running")
     args = parser.parse_args()
 
-    llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, num_speculative_tokens=args.num_speculative_tokens,
+    llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,
               speculative_model=args.speculative_model)
     prompts = build_prompts(llm.tokenizer, args.workload, args.num_prompts, args.max_prompt_tokens)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
@@ -68,7 +69,7 @@ def main():
     t = time.perf_counter() - t
     acceptance = scheduler.num_accepted_tokens / scheduler.num_draft_tokens if scheduler.num_draft_tokens else 0.0
     drafter = "none" if not args.num_speculative_tokens else "model" if args.speculative_model else "ngram"
-    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} batch={args.batch_size} T={args.temperature} "
+    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} batch={args.batch_size} T={args.temperature} "
           f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f}")
 
 

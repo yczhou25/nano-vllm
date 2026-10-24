@@ -249,7 +249,8 @@ class ModelRunner:
         """Decode inputs for speculative decoding with a draft model, computed on the GPU: with
         async scheduling the number of tokens the in-flight step added, and so every position, is
         only known there. Also prepares the draft model's inputs (see propose)."""
-        k = self.num_speculative_tokens
+        k = seqs[0].num_scheduled_tokens - 1    # drafts in this step: num_speculative_tokens, or 0 for a large batch
+        kd = max(k, 1)                          # draft steps: the first runs even without drafts, to keep the draft KV cache current
         block_size = self.block_size
 
         def to_cuda(values, dtype):
@@ -280,9 +281,9 @@ class ModelRunner:
         # The draft model first scores the last two tokens at positions num_tokens - 2 and
         # num_tokens - 1, then each draft it produces. The second-to-last token is usually in its
         # KV cache already; its slot is masked then so that no hashed block is written.
-        draft_positions = positions - 1
+        draft_positions = (num_tokens - 2).unsqueeze(1) + torch.arange(kd + 1, device=num_tokens.device)
         prev_slot = (block_tables.gather(1, draft_positions[:, :1] // block_size) * block_size + draft_positions[:, :1] % block_size).to(torch.int32)
-        draft_slot_mapping = torch.cat([torch.where(lags.unsqueeze(1), prev_slot, -1), slot_mapping[:, :k]], dim=1)
+        draft_slot_mapping = torch.cat([torch.where(lags.unsqueeze(1), prev_slot, -1), slot_mapping[:, :kd]], dim=1)
         self.draft_inputs = torch.stack([prev_token, last_token], dim=1), draft_positions, draft_slot_mapping
         set_context(False, slot_mapping=slot_mapping.view(-1), context_lens=(num_tokens + k).to(torch.int32), block_tables=block_tables)
         return input_ids.view(-1), positions.view(-1)
@@ -315,27 +316,33 @@ class ModelRunner:
             return outputs[:n]
 
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        graphs, outputs = (self.graphs, self.graph_vars["outputs"]) if self.graphs is not None else (None, None)
+        graphs = outputs = None
+        if self.graphs is not None and not is_prefill:
+            q = input_ids.size(0) // get_context().context_lens.size(0)    # tokens per sequence in this step
+            graphs, outputs = self.graphs[q], self.graph_vars["outputs"]
         return self.model.compute_logits(self.forward(self.model, graphs, outputs, input_ids, positions, is_prefill))
 
     @torch.inference_mode()
     def propose(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Run the draft model num_speculative_tokens times and write its greedy tokens into the
-        draft columns of input_ids (one row of batch_size * (k + 1)). The proposals are
-        deterministic given the context, so RejectionSampler stays exact."""
-        k = self.num_speculative_tokens
+        """Run the draft model k times and write its greedy tokens into the draft columns of
+        input_ids (one row of batch_size * (k + 1)). The proposals are deterministic given the
+        context, so RejectionSampler stays exact. In a step without drafts (k == 0, a large batch)
+        the first draft step still runs, so that the draft KV cache keeps up with the target's."""
         context = get_context()    # the target's
         context_lens, block_tables = context.context_lens, context.block_tables
         draft_input_ids, draft_positions, draft_slot_mapping = self.draft_inputs
         bs = draft_input_ids.size(0)
+        k = input_ids.numel() // bs - 1
         input_ids = input_ids.view(bs, k + 1)
         tokens = draft_input_ids.view(-1)
-        for i in range(k):
+        for i in range(max(k, 1)):
             cols = slice(0, 2) if i == 0 else slice(i + 1, i + 2)
             q = cols.stop - cols.start    # tokens per sequence in this draft step
             set_context(False, slot_mapping=draft_slot_mapping[:, cols].reshape(-1), context_lens=context_lens - k + i, block_tables=block_tables)
             graphs, outputs = (self.draft_graphs[q], self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
             hidden_states = self.forward(self.draft_model, graphs, outputs, tokens, draft_positions[:, cols].reshape(-1), False)
+            if i == k:    # k == 0: the step only wrote the newest token's draft KV
+                break
             logits = self.draft_model.compute_logits(hidden_states[q - 1::q])
             tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")
             if self.world_size > 1:
@@ -352,8 +359,9 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
         if self.draft_model is not None and is_prefill:
             self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
+        k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
         token_ids = None
-        if self.rank == 0 and (is_prefill or not self.num_speculative_tokens):
+        if self.rank == 0 and not k:
             token_ids = self.sampler(logits, temperatures).tolist()
         elif self.rank == 0:
             draft_token_ids = input_ids.view(len(seqs), -1)[:, 1:]
@@ -364,7 +372,7 @@ class ModelRunner:
     def run_async(self, seqs: list[Sequence], is_prefill: bool) -> "AsyncOutput | None":
         """Like run, but returns before the GPU finishes. The sampled tokens stay on the GPU as
         inputs for the next decode step, and are copied to the host in the background."""
-        k = self.num_speculative_tokens
+        k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         if self.draft_model is not None and not is_prefill:
@@ -372,16 +380,18 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
         if self.draft_model is not None and is_prefill:
             self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
-        if self.rank == 0 and (is_prefill or not k):
+        if self.rank == 0 and not k:
             token_ids = self.sampler(logits, temperatures)
         elif self.rank == 0:
             token_ids = self.rejection_sampler(logits, temperatures, input_ids.view(len(seqs), -1)[:, 1:])
         else:
-            token_ids = torch.empty((len(seqs), k + 1) if k and not is_prefill else len(seqs), dtype=torch.int64, device="cuda")
+            token_ids = torch.empty((len(seqs), k + 1) if k else len(seqs), dtype=torch.int64, device="cuda")
         if self.world_size > 1:
             dist.broadcast(token_ids, 0)    # every rank needs them as next-step inputs
-        # With speculative decoding every step's output has a row per sequence (see AsyncOutput).
-        self.last_token_ids = token_ids if token_ids.dim() == 2 or not k else torch.nn.functional.pad(token_ids.unsqueeze(1), (0, k), value=-1)
+        # With speculative decoding every step's output has a row per sequence, padded to the
+        # configured number of drafts (see AsyncOutput), whether or not this step drafted.
+        K = self.num_speculative_tokens
+        self.last_token_ids = token_ids if token_ids.dim() == 2 or not K else torch.nn.functional.pad(token_ids.unsqueeze(1), (0, K), value=-1)
         reset_context()
         return AsyncOutput(token_ids) if self.rank == 0 else None
 
@@ -410,7 +420,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        q = 1 + self.num_speculative_tokens    # tokens per sequence in a decode step
+        q = 1 + self.num_speculative_tokens    # tokens per sequence in a decode step with drafts
         max_num_blocks = (config.max_model_len + q - 1 + self.block_size - 1) // self.block_size
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_pool = None
@@ -422,7 +432,10 @@ class ModelRunner:
             block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32),
             outputs=torch.zeros(max_bs * q, hf_config.hidden_size),
         )
-        self.graphs = self.capture_graphs(self.model, self.graph_vars["outputs"], q)
+        # Decode steps without drafts (a large batch, see Scheduler.schedule) need their own graphs.
+        self.graphs = {}
+        for q in sorted({q} | ({1} if config.speculative_disable_by_batch_size is not None else set())):
+            self.graphs[q] = self.capture_graphs(self.model, self.graph_vars["outputs"], q)
         self.draft_graphs = {}
         if self.draft_model is not None:
             # The first draft step scores two tokens per sequence, the others one (see propose).

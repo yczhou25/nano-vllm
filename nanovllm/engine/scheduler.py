@@ -16,6 +16,7 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.num_speculative_tokens = config.num_speculative_tokens
         self.has_draft_model = config.speculative_model is not None    # the model runner drafts on the GPU
+        self.speculative_disable_by_batch_size = config.speculative_disable_by_batch_size
         self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens and not self.has_draft_model else None
         self.num_draft_tokens = self.num_accepted_tokens = 0    # speculative decoding statistics
         self.waiting: deque[Sequence] = deque()
@@ -60,7 +61,10 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        num_decode_tokens = 1 + self.num_speculative_tokens
+        k = self.num_speculative_tokens
+        if k and self.speculative_disable_by_batch_size is not None and len(self.running) > self.speculative_disable_by_batch_size:
+            k = 0    # a batch this large keeps the GPU busy by itself; the k extra positions would not be free
+        num_decode_tokens = 1 + k
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
@@ -77,7 +81,7 @@ class Scheduler:
                 seq.num_scheduled_tokens = num_decode_tokens
                 seq.is_prefill = False
                 if self.proposer:
-                    seq.draft_token_ids = self.proposer.propose(seq)
+                    seq.draft_token_ids = self.proposer.propose(seq) if k else []
                 self.block_manager.may_append(seq, num_decode_tokens)
                 scheduled_seqs.append(seq)
                 kept_seqs.append(seq)

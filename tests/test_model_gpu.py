@@ -37,6 +37,8 @@ ENGINE_OPTIONS = {
     "spec": {"num_speculative_tokens": 4},
     "draft": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL},
     "async_draft": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL},
+    # Drafts only while at most 2 sequences run: the 4 questions decode without them, the 2 documents with them.
+    "draft_adaptive": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_disable_by_batch_size": 2},
 }
 
 
@@ -86,7 +88,7 @@ def test_greedy_matches_reference(llm, reference):
     for prompt, completion in zip(prompts, generate(llm, prompts)):
         assert completion
         check(reference, prompt, completion)
-    if scheduler.has_draft_model and os.path.samefile(DRAFT_MODEL, MODEL):
+    if scheduler.has_draft_model and scheduler.num_draft_tokens and os.path.samefile(DRAFT_MODEL, MODEL):
         # The target drafting for itself: every draft matches the greedy token unless bf16 noise
         # between the draft and verification passes flips a near-tie.
         assert scheduler.num_accepted_tokens / scheduler.num_draft_tokens > 0.8
