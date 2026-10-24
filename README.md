@@ -72,7 +72,7 @@ Measured on one NVIDIA A40 (bf16, CUDA graphs on). `bench.py` is upstream's thro
 | | draft model (0.6B itself), k=4 | 1,023 tok/s | 1.00 |
 | | draft model + `async_scheduling`, k=4 | 1,066 tok/s | 1.00 |
 
-**Qwen3-8B with Qwen3-0.6B drafting** (code editing and chat, batch 1/8/32, greedy and T=0.6) is running and will be added here.
+**Qwen3-8B with Qwen3-0.6B drafting** (code editing and chat, batch 1/8/32, greedy and T=0.6, with and without adaptive speculation) is queued on the cluster and will be added here.
 
 ## Credits
 
