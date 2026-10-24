@@ -42,25 +42,32 @@ class ModelRunner:
         self.last_token_ids = None    # last run_async step's sampled tokens, still on the GPU (see AsyncOutput)
         self.draft_model = None
         self.draft_inputs = None      # the draft model's decode inputs, prepared with the target's
+        self.graphs = None            # CUDA graphs by decode batch size, once captured (see capture_cudagraph)
+        self.draft_graphs = None
+        self.graph_pool = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
-        default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        if config.speculative_model is not None:
-            self.draft_model = Qwen3ForCausalLM(config.draft_hf_config)
-            load_model(self.draft_model, config.speculative_model)
-        self.sampler = Sampler()
-        self.rejection_sampler = RejectionSampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        try:
+            torch.cuda.set_device(rank)
+            default_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(hf_config.dtype)
+            torch.set_default_device("cuda")
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
+            if config.speculative_model is not None:
+                self.draft_model = Qwen3ForCausalLM(config.draft_hf_config)
+                load_model(self.draft_model, config.speculative_model)
+            self.sampler = Sampler()
+            self.rejection_sampler = RejectionSampler()
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+            torch.set_default_device("cpu")
+            torch.set_default_dtype(default_dtype)
+        except Exception:
+            dist.destroy_process_group()    # or the next engine in this process could not start
+            raise
 
         if self.world_size > 1:
             if rank == 0:
@@ -77,8 +84,7 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.draft_graphs, self.graph_pool
+        del self.graphs, self.draft_graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -289,9 +295,9 @@ class ModelRunner:
     @torch.inference_mode()
     def forward(self, model: Qwen3ForCausalLM, graphs: dict | None, outputs: torch.Tensor | None, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         """Hidden states of input_ids, through a captured CUDA graph when there is one for this
-        decode batch size."""
+        decode batch size (none during warmup, or with enforce_eager)."""
         context = get_context()
-        if is_prefill or self.enforce_eager or context.context_lens.size(0) > 512:
+        if is_prefill or graphs is None or context.context_lens.size(0) > 512:
             return model(input_ids, positions)
         else:
             bs = context.context_lens.size(0)
@@ -309,7 +315,7 @@ class ModelRunner:
             return outputs[:n]
 
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        graphs, outputs = (self.graphs, self.graph_vars["outputs"]) if not self.enforce_eager else (None, None)
+        graphs, outputs = (self.graphs, self.graph_vars["outputs"]) if self.graphs is not None else (None, None)
         return self.model.compute_logits(self.forward(self.model, graphs, outputs, input_ids, positions, is_prefill))
 
     @torch.inference_mode()
@@ -328,7 +334,7 @@ class ModelRunner:
             cols = slice(0, 2) if i == 0 else slice(i + 1, i + 2)
             q = cols.stop - cols.start    # tokens per sequence in this draft step
             set_context(False, slot_mapping=draft_slot_mapping[:, cols].reshape(-1), context_lens=context_lens - k + i, block_tables=block_tables)
-            graphs, outputs = (self.draft_graphs[q], self.graph_vars["draft_outputs"]) if not self.enforce_eager else (None, None)
+            graphs, outputs = (self.draft_graphs[q], self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
             hidden_states = self.forward(self.draft_model, graphs, outputs, tokens, draft_positions[:, cols].reshape(-1), False)
             logits = self.draft_model.compute_logits(hidden_states[q - 1::q])
             tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")

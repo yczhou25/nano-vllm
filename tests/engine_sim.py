@@ -28,6 +28,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.context import get_context, set_context, reset_context
 
 VOCAB = 40
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"    # where ModelRunner's tensors live
 EOS = 0
 TARGET_SEED = 12345
 DRAFT_SEED = 54321
@@ -54,6 +55,7 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
     runner.num_speculative_tokens = num_speculative_tokens
     runner.draft_model = None
     runner.draft_inputs = None
+    runner.graphs = runner.draft_graphs = runner.graph_pool = None    # no CUDA graphs: forward runs eagerly
     return runner
 
 
@@ -223,10 +225,10 @@ class FakeModel:
         self.last_outputs = {seq.seq_id: t for seq, t in zip(seqs, token_ids)}
         k = self.num_speculative_tokens
         if not k:
-            self.runner.last_token_ids = torch.tensor(token_ids, dtype=torch.int64)
+            self.runner.last_token_ids = torch.tensor(token_ids, dtype=torch.int64, device=DEVICE)
         else:    # a row per sequence, -1 padded, as ModelRunner.run_async keeps it
             rows = [t if isinstance(t, list) else [t] for t in token_ids]
-            self.runner.last_token_ids = torch.tensor([row + [-1] * (k + 1 - len(row)) for row in rows], dtype=torch.int64)
+            self.runner.last_token_ids = torch.tensor([row + [-1] * (k + 1 - len(row)) for row in rows], dtype=torch.int64, device=DEVICE)
         return token_ids if method_name == "run" else FakeOutput(token_ids)
 
     def run(self, seqs, is_prefill):
@@ -357,11 +359,10 @@ class FakeModel:
         # A target model that is certain of each next token, verified by the real rejection sampler
         # (compiled, on the GPU if there is one) with the draft tokens taken from the inputs, as
         # ModelRunner.run does.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logits = torch.full((len(ids), VOCAB), -1000.0, device=device)
+        logits = torch.full((len(ids), VOCAB), -1000.0, device=DEVICE)
         logits[torch.arange(len(ids)), torch.tensor(sum(targets, []))] = 0.0
-        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=device)
-        draft_token_ids = torch.tensor(ids, dtype=torch.int64, device=device).view(len(seqs), q)[:, 1:]
+        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=DEVICE)
+        draft_token_ids = torch.tensor(ids, dtype=torch.int64, device=DEVICE).view(len(seqs), q)[:, 1:]
         token_ids = accepted_token_ids(self.rejection_sampler(logits, temperatures, draft_token_ids).tolist())
         for i, seq in enumerate(seqs):
             accepted = next(j for j in range(q) if j == q - 1 or all_drafts[i][j] != targets[i][j])
