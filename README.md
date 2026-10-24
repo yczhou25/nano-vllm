@@ -56,7 +56,22 @@ NANOVLLM_TEST_MODEL=~/huggingface/Qwen3-0.6B/ pytest -m gpu   # GPU: greedy outp
 
 ## Benchmarks
 
-`bench.py` is upstream's throughput benchmark; `bench_spec.py` adds `--async-scheduling`, `--num-speculative-tokens` and `--speculative-model`. A40 numbers for Qwen3-0.6B and Qwen3-8B (with Qwen3-0.6B as the draft) are being collected and will be added here.
+Measured on one NVIDIA A40 (bf16, CUDA graphs on). `bench.py` is upstream's throughput benchmark on random tokens; `bench_spec.py` adds `--async-scheduling`, `--num-speculative-tokens` and `--speculative-model` and uses workloads with real text: a code-editing task whose output repeats most of its input, and open-ended chat. On the same GPU the whole test suite passes (2,680 tests), including greedy outputs that match `transformers` in fp32 within 0.5 logits for all five engine configurations.
+
+**Qwen3-0.6B.** The draft model in this run is Qwen3-0.6B itself, so its drafts are always accepted and it cannot be faster than the baseline; those rows only exercise the verification path.
+
+| Benchmark | Configuration | Throughput | Acceptance |
+|---|---|---|---|
+| `bench.py`, 64 random prompts, up to 256 in / 256 out | baseline | 6,200 tok/s | |
+| | `async_scheduling` | 6,842 tok/s (+10%) | |
+| | n-gram drafts, k=4 | 1,804 tok/s | ~0 (random tokens: nothing to look up) |
+| `bench_spec.py --workload edit --batch-size 8`, greedy | baseline | 1,196 tok/s | |
+| | `async_scheduling` | 1,300 tok/s (+9%) | |
+| | n-gram drafts, k=4 | 2,376 tok/s (1.99x) | 0.80 |
+| | draft model (0.6B itself), k=4 | 1,023 tok/s | 1.00 |
+| | draft model + `async_scheduling`, k=4 | 1,066 tok/s | 1.00 |
+
+**Qwen3-8B with Qwen3-0.6B drafting** (code editing and chat, batch 1/8/32, greedy and T=0.6) is running and will be added here.
 
 ## Credits
 
