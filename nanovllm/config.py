@@ -26,7 +26,8 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.num_speculative_tokens >= 0
-        assert not (self.async_scheduling and self.num_speculative_tokens), "speculative decoding does not support async scheduling yet"
+        assert not (self.async_scheduling and self.num_speculative_tokens and self.speculative_model is None), \
+            "n-gram drafts need the sampled tokens on the CPU; with async scheduling use a draft model (speculative_model)"
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if self.speculative_model is not None:

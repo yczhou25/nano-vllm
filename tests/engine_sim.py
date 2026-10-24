@@ -58,7 +58,7 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
 
 
 def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False, num_speculative_tokens=0, draft_model=False):
-    assert not (async_scheduling and num_speculative_tokens)
+    assert not (async_scheduling and num_speculative_tokens and not draft_model)
     engine = LLMEngine.__new__(LLMEngine)
     engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens,
                                              num_speculative_tokens=num_speculative_tokens, draft_model=draft_model))
@@ -144,9 +144,10 @@ class FakeDraftModel:
         self.token_ids = []     # per sequence: its tokens plus the drafts proposed so far
         self.drafts = []
 
-    def begin(self, seqs):
+    def begin(self, seqs, token_ids):
+        """token_ids: per sequence, its tokens including those still in flight."""
         self.seqs = seqs
-        self.token_ids = [list(seq.token_ids) for seq in seqs]
+        self.token_ids = [list(t) for t in token_ids]
         self.drafts = [[] for _ in seqs]
 
     def __call__(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -220,8 +221,12 @@ class FakeModel:
             if not is_prefill or seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 self.num_samples[seq.seq_id] += len(t) if isinstance(t, list) else 1
         self.last_outputs = {seq.seq_id: t for seq, t in zip(seqs, token_ids)}
-        if not self.num_speculative_tokens:
+        k = self.num_speculative_tokens
+        if not k:
             self.runner.last_token_ids = torch.tensor(token_ids, dtype=torch.int64)
+        else:    # a row per sequence, -1 padded, as ModelRunner.run_async keeps it
+            rows = [t if isinstance(t, list) else [t] for t in token_ids]
+            self.runner.last_token_ids = torch.tensor([row + [-1] * (k + 1 - len(row)) for row in rows], dtype=torch.int64)
         return token_ids if method_name == "run" else FakeOutput(token_ids)
 
     def run(self, seqs, is_prefill):
@@ -276,11 +281,11 @@ class FakeModel:
             outputs.append(next_token(seq.token_ids[:k_len], truth[pos[q1 - 1]]))
         return outputs
 
-    def _propose(self, seqs, meta):
+    def _propose(self, seqs, meta, token_ids):
         """Run the real ModelRunner.propose with the fake draft model on the prepared inputs, and
         return the input ids with the draft columns filled in."""
         draft_model = self.runner.draft_model
-        draft_model.begin(seqs)
+        draft_model.begin(seqs, token_ids)
         set_context(False, slot_mapping=torch.tensor(meta["slot_mapping"], dtype=torch.int32),
                     context_lens=torch.tensor(meta["context_lens"], dtype=torch.int32),
                     block_tables=torch.tensor(meta["block_tables"], dtype=torch.int32))
@@ -305,27 +310,33 @@ class FakeModel:
         q = 1 + self.num_speculative_tokens
         if len(ids) != q * len(seqs):
             raise Violation(f"{len(ids)} decode inputs for {len(seqs)} seqs, expected {q} each")
+        # Each sequence's tokens, including those of the step still in flight (async scheduling).
+        all_token_ids = []
+        for seq in seqs:
+            token_ids = list(seq.token_ids)
+            if seq.num_inflight:
+                inflight = self.last_outputs.get(seq.seq_id)
+                if inflight is None or seq.num_inflight not in (1, q):
+                    raise Violation(f"seq {seq.seq_id}: {seq.num_inflight} tokens in flight but no step produced them")
+                token_ids += inflight if isinstance(inflight, list) else [inflight]
+            all_token_ids.append(token_ids)
         if self.draft_kv:
             draft_ids, draft_pos, draft_slots = meta["draft_inputs"]
             for i, seq in enumerate(seqs):
-                n = len(seq.token_ids)
-                if draft_ids[i] != seq.token_ids[-2:] or draft_pos[i] != list(range(n - 2, n + q - 2)):
+                n = len(all_token_ids[i])
+                if draft_ids[i] != all_token_ids[i][-2:] or draft_pos[i] != list(range(n - 2, n + q - 2)):
                     raise Violation(f"seq {seq.seq_id}: draft inputs {draft_ids[i]} at {draft_pos[i]} for {n} tokens")
                 if draft_slots[i][1:] != slots[i * q:(i + 1) * q - 1]:
                     raise Violation(f"seq {seq.seq_id}: draft slots {draft_slots[i]} vs target slots {slots[i * q:(i + 1) * q]}")
-            ids, all_drafts = self._propose(seqs, meta)
+            ids, all_drafts = self._propose(seqs, meta, all_token_ids)
         else:
             all_drafts = [seq.draft_token_ids for seq in seqs]
         truths, targets = [], []
         for i, seq in enumerate(seqs):
             rows = range(i * q, (i + 1) * q)
-            token_ids = seq.token_ids
-            if seq.num_inflight:
-                if seq.num_inflight != 1 or ids[rows[0]] != self.last_outputs.get(seq.seq_id):
-                    raise Violation(f"seq {seq.seq_id}: in-flight input {ids[rows[0]]} is not the token sampled last step")
-                token_ids = token_ids + [ids[rows[0]]]
-            elif ids[rows[0]] != token_ids[-1]:
-                raise Violation(f"seq {seq.seq_id}: wrong decode input id")
+            token_ids = all_token_ids[i]
+            if ids[rows[0]] != token_ids[-1]:
+                raise Violation(f"seq {seq.seq_id}: decode input {ids[rows[0]]} is not the newest token {token_ids[-1]}")
             drafts = ids[rows.start + 1:rows.stop]
             if drafts != all_drafts[i]:
                 raise Violation(f"seq {seq.seq_id}: draft inputs {drafts} != proposed {all_drafts[i]}")
@@ -445,24 +456,28 @@ def run_engine(engine, requests, max_steps=50000):
         live_seqs = [s for s in [*scheduler.running, *scheduler.waiting] if s.block_table]
         check_block_manager(scheduler.block_manager, live_seqs)
         engine.model_runner.check_hashed_blocks(live_seqs)
-        if not engine.async_scheduling:    # (async: the committed step's blocks are hashed when it lands)
-            for seq in live_seqs:
-                # Every full block of valid KV is registered for prefix caching, except the one
-                # the draft model has not caught up on yet.
-                num_hashed = sum((i + 1) * seq.block_size <= seq.num_cached_tokens - seq.draft_cache_lags for i in range(len(seq.block_table)))
-                if any(scheduler.block_manager.blocks[block_id].hash == -1 for block_id in seq.block_table[:num_hashed]):
-                    raise Violation(f"seq {seq.seq_id}: a full block with valid KV is not hashed")
+        # An in-flight prefill chunk's KV is counted in num_cached_tokens already but hashed only
+        # once the step lands (async scheduling).
+        inflight = {seq: num_tokens for seq, is_prefill, _, num_tokens, _ in (engine.pending[0] if engine.pending else []) if is_prefill}
+        for seq in live_seqs:
+            # Every full block of valid KV is registered for prefix caching, except the one the
+            # draft model has not caught up on yet.
+            num_valid = seq.num_cached_tokens - inflight.get(seq, 0) - seq.draft_cache_lags
+            num_hashed = sum((i + 1) * seq.block_size <= num_valid for i in range(len(seq.block_table)))
+            if any(scheduler.block_manager.blocks[block_id].hash == -1 for block_id in seq.block_table[:num_hashed]):
+                raise Violation(f"seq {seq.seq_id}: a full block with valid KV is not hashed")
         k = engine.model_runner.num_speculative_tokens
         for _, seq in seqs.values():
             if seq.num_completion_tokens > seq.max_tokens:
                 raise Violation(f"seq {seq.seq_id}: more than max_tokens completion tokens")
-            # Async scheduling may sample one token too many for a seq that hit EOS, never more.
             # Speculative decoding may produce up to k tokens past EOS or max_tokens in the last step.
-            in_flight = 0 if seq.is_finished else seq.num_inflight
-            wasted = engine.model_runner.num_samples[seq.seq_id] - seq.num_completion_tokens - in_flight
-            allowed = (engine.async_scheduling and seq.is_finished and seq.num_completion_tokens < seq.max_tokens) + k * seq.is_finished
-            if wasted > allowed:
-                raise Violation(f"seq {seq.seq_id}: {wasted} sampled tokens thrown away")
+            # Async scheduling may run one step too many (1 + k tokens) for a seq that hit EOS, never
+            # more, and none for a seq that reached max_tokens.
+            if seq.is_finished:
+                wasted = engine.model_runner.num_samples[seq.seq_id] - seq.num_completion_tokens
+                allowed = k + (1 + k) * (engine.async_scheduling and seq.num_completion_tokens < seq.max_tokens)
+                if wasted > allowed:
+                    raise Violation(f"seq {seq.seq_id}: {wasted} sampled tokens thrown away")
         step += 1
         if step > max_steps:
             raise Violation("engine did not finish")

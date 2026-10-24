@@ -64,7 +64,7 @@ class Scheduler:
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            if seq.num_completion_tokens + seq.num_inflight == seq.max_tokens:    # last token is in flight
+            if seq.num_completion_tokens + seq.num_inflight >= seq.max_tokens:    # the step in flight may finish it
                 kept_seqs.append(seq)
                 continue
             while not self.block_manager.can_append(seq, num_decode_tokens):
@@ -91,44 +91,51 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def commit(self, seqs: list[Sequence], is_prefill: bool) -> list[tuple[Sequence, int, int, bool]]:
+    def commit(self, seqs: list[Sequence], is_prefill: bool) -> list[tuple[Sequence, bool, int, int, int]]:
         """Advance sequences past a step that has been launched. Its sampled tokens stay in flight
-        until postprocess, so with async scheduling the next step can be scheduled first."""
+        until postprocess, so with async scheduling the next step can be scheduled first. A prefill
+        chunk's KV is counted now, so that the next chunk follows it; a decode step's KV is counted
+        in postprocess, once the number of accepted draft tokens is known."""
         batch = []
         for row, seq in enumerate(seqs):
             start, num_tokens = seq.num_cached_tokens, seq.num_scheduled_tokens
-            seq.num_cached_tokens += num_tokens
             seq.num_scheduled_tokens = 0
-            samples = not is_prefill or seq.num_cached_tokens == seq.num_tokens
-            if samples:
-                seq.num_inflight += 1
+            if is_prefill:
+                seq.num_cached_tokens += num_tokens
+                num_inflight = int(seq.num_cached_tokens == seq.num_tokens)    # samples once the prompt is done
+            else:
+                num_inflight = num_tokens    # the newest token and the drafts: the most the step can add
+            if num_inflight:
+                seq.num_inflight += num_inflight
                 seq.inflight_row = row
-            batch.append((seq, start, num_tokens, samples))
+            batch.append((seq, is_prefill, start, num_tokens, num_inflight))
         return batch
 
-    def postprocess(self, batch: list[tuple[Sequence, int, int, bool]], token_ids: list[int] | list[list[int]]) -> list[Sequence]:
+    def postprocess(self, batch: list[tuple[Sequence, bool, int, int, int]], token_ids: list[int] | list[list[int]]) -> list[Sequence]:
         """token_ids has one token per sequence, or with speculative decoding, a list per decoded
         sequence: its accepted draft tokens followed by one sampled token."""
         finished = []
-        for (seq, start, num_tokens, samples), new_token_ids in zip(batch, token_ids):
+        for (seq, is_prefill, start, num_tokens, num_inflight), new_token_ids in zip(batch, token_ids):
             if seq.is_finished:    # finished while this step was in flight
                 continue
             stop = False
-            if samples:
-                seq.num_inflight -= 1
+            if num_inflight:
+                seq.num_inflight -= num_inflight
                 speculative = isinstance(new_token_ids, list)
                 for token_id in new_token_ids if speculative else [new_token_ids]:
                     seq.append_token(token_id)
                     stop = (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
                     if stop:
                         break
+                if not is_prefill:
+                    # The step wrote the KV of its input token and of the drafts after it; only the
+                    # input token's and the accepted drafts' is valid, later steps overwrite the rest.
+                    start = seq.num_cached_tokens
+                    num_tokens = seq.num_tokens - start - 1
+                    seq.num_cached_tokens = start + num_tokens
                 if speculative:
                     self.num_draft_tokens += self.num_speculative_tokens
                     self.num_accepted_tokens += len(new_token_ids) - 1
-                    # Only the KV of the input token and the accepted drafts is valid; later steps
-                    # overwrite the rest.
-                    num_tokens = seq.num_tokens - start - 1
-                    seq.num_cached_tokens = start + num_tokens
                     # The draft model scores every draft but the last one, so when all of them are
                     # accepted its KV cache lacks the newest cached token. The next step's draft
                     # inputs fill it in (ModelRunner.prepare_decode); until then that token's

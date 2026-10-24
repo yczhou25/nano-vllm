@@ -36,6 +36,7 @@ ENGINE_OPTIONS = {
     "async": {"async_scheduling": True},
     "spec": {"num_speculative_tokens": 4},
     "draft": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL},
+    "async_draft": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL},
 }
 
 

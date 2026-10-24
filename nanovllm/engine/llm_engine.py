@@ -54,8 +54,6 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         if not self.async_scheduling:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
-            if not is_prefill and self.scheduler.num_speculative_tokens:
-                num_tokens = -sum(map(len, token_ids))
             finished = self.scheduler.postprocess(self.scheduler.commit(seqs, is_prefill), token_ids)
         else:
             # Launch this step before waiting for the previous one, so the GPU always has work queued
@@ -64,10 +62,13 @@ class LLMEngine:
             if seqs:
                 output = self.model_runner.call("run_async", seqs, is_prefill)
                 self.pending = self.scheduler.commit(seqs, is_prefill), output
-            finished = []
+            finished, token_ids = [], None
             if pending:
                 batch, output = pending
-                finished = self.scheduler.postprocess(batch, output.result())
+                token_ids = output.result()
+                finished = self.scheduler.postprocess(batch, token_ids)
+        if not is_prefill and token_ids and isinstance(token_ids[0], list):    # speculative decoding: the tokens a step produced
+            num_tokens = -sum(map(len, token_ids))
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
         return outputs, num_tokens
 

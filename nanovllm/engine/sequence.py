@@ -24,8 +24,8 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
-        self.num_inflight = 0       # tokens sampled on the GPU but not appended yet (async scheduling)
-        self.inflight_row = -1      # row of the newest in-flight token in the last step's output
+        self.num_inflight = 0       # tokens the step still on the GPU may add (async scheduling): 1, or 1 + num_speculative_tokens
+        self.inflight_row = -1      # row of this sequence in the in-flight step's output
         self.draft_token_ids = []   # tokens proposed for this decode step (speculative decoding with n-gram drafts)
         self.draft_cache_lags = False   # the draft model's KV cache lacks the newest cached token (see Scheduler.postprocess)
         self.is_prefill = True
