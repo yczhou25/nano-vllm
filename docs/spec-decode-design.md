@@ -232,15 +232,22 @@ Slurm 作业 225010，1 张 A40，bf16，1 小时 39 分（约 300 SU）。目�
 | 不带草稿的步之后不清 `draft_cache_lags` | 0（等价：多重写一次同样的 KV，哈希晚一步） |
 | 块分配按配置的 k 而不是这一步的 k | 25 |
 
-### 自适应 k 的修正（2026-10-25，进行中）
+### 自适应 k 的修正：草稿 cache 可以掉队（2026-10-25）
 
-不带草稿的步完全跳过草稿模型，让它的 cache 掉队；每条序列记下草稿 cache 里有多少个 token（`draft_len`）。恢复投机的那一步，先让草稿模型补齐：每条序列缺的 token 数不同，所以这一步走 prefill 那套变长注意力（`flash_attn_varlen_func` + 分页 KV，和前缀缓存命中时的 prefill 一样），不用 CUDA graph；补齐前向最后一个位置的 logits 就是第一个草稿 token，之后的 k-1 步照常走 1-query 的 CUDA graph。切换只在 batch 大小跨过阈值时发生，所以变长前向很少跑；正常投机的步（缺 1 或 2 个 token）仍走原来的 2-query 图。
+不带草稿的步完全跳过草稿模型，让它的 cache 掉队；每条序列记下草稿 cache 覆盖到哪（`seq.num_draft_cached_tokens`，取代原来的布尔 `draft_cache_lags`）。恢复投机的那一步，草稿模型先补齐再打草稿：
+
+- **补齐步的形状仍然统一**：每条序列缺的 token 数不同，但不走变长注意力，而是所有序列都算最后 m 个 token（m = batch 里最大的缺口，至少 2），用和目标模型 `(B, k+1)` 一样的 `flash_attn_with_kvcache` 右对齐因果掩码。已经在 cache 里的位置 slot 置 -1（算了但不写），比 m 短的序列前面补 0（位置夹到 0，输出丢掉）。最后一列的 logits 就是第一个草稿 token，之后 k-1 步照常走 1-query 的 CUDA graph。
+- **m=2 时走原来的 2-query 图**：正常投机的步缺 1 或 2 个 token，和改之前完全一样；只有刚从"关草稿"切回来的那一步 m>2，走 eager 前向，这种切换只在 batch 大小跨过阈值时发生。
+- **异步调度下在途步的处理**：在途的步如果带草稿，它自己已经补齐过，落地后缺口只会是 1 或 2（全接受时 2），所以 m 的上界按 2 算；如果在途的步不带草稿，缺口 = CPU 已知的缺口 + 在途 token 数。补齐输入在 GPU 上拼：CPU 已知的尾巴 + 在途输出，再按每条序列的在途 token 数 gather 出最后 m 个。TP 的其他 rank 通过 pickle 拿到的是 `token_ids[num_draft_cached:]`，所以尾巴里已缓存的位置统一填 0，各 rank 算出的输入一致。
+- **哈希只到两个 cache 都有的地方**：`hash_blocks(seq, start, min(num_cached, num_draft_cached) - start)`；关草稿期间填满的块先不哈希，补齐那一步落地后 `hash_blocks` 的回扫把它们一起补上。前缀缓存命中的块两个 cache 都有，所以分配时 `num_draft_cached = num_cached`；prefill 两个模型一起算，commit 时同步推进。
+
+模拟器相应改成：不带草稿的步不许准备草稿输入；补齐步核对每条序列的位置是 `max(0, n-m..n-1)`、未屏蔽的 slot 和 token 都对、最新 token 一定写入、补 0 的行不写；缺口有没有补全靠假草稿模型读 cache 时逐位置核对。
 
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。
 - ngram 版和异步调度合并：要把 ngram 查找搬到 GPU 上（vLLM 的做法是 CPU 上查、但等上一步落地，等于放弃了异步）。草稿模型版已经合并（见上）。
-- k 自适应：已做并在 8B 上测过（见上），正在改成"草稿 cache 可以掉队、恢复时补齐"；更细的做法是按接受率动态调 k（chat 上 k=2 比 k=4 好，edit 上 k=6 最好）。
+- k 自适应：已做并在 8B 上测过（见上），已改成"草稿 cache 可以掉队、恢复时补齐"，等 GPU 复测；更细的做法是按接受率动态调 k（chat 上 k=2 比 k=4 好，edit 上 k=6 最好）。
 - 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：温度采样下接受率更高，要多存 `(B, k, V)` 的 q。
 - EAGLE-3 草稿头（可选）。
 - ngram 索引在 CPU 上：长 prompt 第一次 decode 要建索引，每个 token 4 次字典写入。

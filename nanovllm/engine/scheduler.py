@@ -49,6 +49,7 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+                seq.num_draft_cached_tokens = seq.num_cached_tokens    # a hashed block holds both models' KV
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -91,7 +92,7 @@ class Scheduler:
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
-        seq.draft_cache_lags = False    # the prefill rebuilds both KV caches
+        seq.num_draft_cached_tokens = 0    # the prefill rebuilds both KV caches
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
@@ -106,6 +107,7 @@ class Scheduler:
             seq.num_scheduled_tokens = 0
             if is_prefill:
                 seq.num_cached_tokens += num_tokens
+                seq.num_draft_cached_tokens = seq.num_cached_tokens    # the draft model prefills alongside the target
                 num_inflight = int(seq.num_cached_tokens == seq.num_tokens)    # samples once the prompt is done
             else:
                 num_inflight = num_tokens    # the newest token and the drafts: the most the step can add
@@ -137,18 +139,23 @@ class Scheduler:
                     start = seq.num_cached_tokens
                     num_tokens = seq.num_tokens - start - 1
                     seq.num_cached_tokens = start + num_tokens
+                    if speculative or not self.has_draft_model:
+                        # A step with drafts first caught the draft model's KV cache up to the newest
+                        # token (ModelRunner.propose), then scored every draft but the last one, so when
+                        # all of them were accepted the cache lacks the newest cached token. A step
+                        # without drafts (see schedule) skips the draft model: its cache falls behind
+                        # until the next step with drafts, and the blocks it lacks must not be hashed
+                        # yet, or a prefix cache hit would read a stale draft KV.
+                        lag = self.has_draft_model and len(new_token_ids) == self.num_speculative_tokens + 1
+                        seq.num_draft_cached_tokens = seq.num_cached_tokens - lag
                 if speculative:
                     self.num_draft_tokens += self.num_speculative_tokens
                     self.num_accepted_tokens += len(new_token_ids) - 1
-                    # The draft model scores every draft but the last one, so when all of them are
-                    # accepted its KV cache lacks the newest cached token. The next step's draft
-                    # inputs fill it in (ModelRunner.prepare_decode); until then that token's
-                    # block must not be hashed, or a prefix cache hit would read a stale draft KV.
-                    seq.draft_cache_lags = self.has_draft_model and len(new_token_ids) == self.num_speculative_tokens + 1
-                else:
-                    seq.draft_cache_lags = False
             if seq.block_table:    # empty if preempted while this step was in flight
-                self.block_manager.hash_blocks(seq, start, num_tokens - seq.draft_cache_lags)
+                # Blocks both KV caches hold completely; the ones a lagging draft cache left for later are hashed
+                # once it catches up (hash_blocks scans back to them).
+                valid = start + num_tokens if is_prefill else min(seq.num_cached_tokens, seq.num_draft_cached_tokens)
+                self.block_manager.hash_blocks(seq, start, valid - start)
             if stop:
                 if seq.status == SequenceStatus.RUNNING:
                     self.running.remove(seq)

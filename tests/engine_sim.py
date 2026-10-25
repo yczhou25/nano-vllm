@@ -124,7 +124,7 @@ def prepare(runner, seqs, is_prefill):
         max_seqlen_k=c.max_seqlen_k,
         context_lens=c.context_lens.tolist() if c.context_lens is not None else None,
         block_tables=c.block_tables.tolist() if c.block_tables is not None else None,
-        draft_inputs=[t.tolist() for t in runner.draft_inputs] if not is_prefill and runner.draft_model is not None else None,
+        draft_inputs=[t.tolist() for t in runner.draft_inputs] if not is_prefill and runner.draft_inputs is not None else None,
     )
     reset_context()
     return meta
@@ -170,17 +170,28 @@ class FakeDraftModel:
         for i, seq in enumerate(self.seqs):
             token_ids, drafts = self.token_ids[i], self.drafts[i]
             n = len(token_ids)
-            expected = token_ids[-q:] if not drafts else [drafts[-1]]
-            if ids[i * q:(i + 1) * q] != expected:
-                raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} inputs {ids[i * q:(i + 1) * q]} != {expected}")
-            if pos[i * q:(i + 1) * q] != list(range(n - q, n)) or context_lens[i] != n:
-                raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} positions {pos[i * q:(i + 1) * q]} context_len {context_lens[i]} for {n} tokens")
+            step_ids, step_pos, step_slots = ids[i * q:(i + 1) * q], pos[i * q:(i + 1) * q], slots[i * q:(i + 1) * q]
+            if drafts:    # one token per sequence: the newest draft
+                expected_ids, expected_pos = [drafts[-1]], [n - 1]
+            else:
+                # The catch-up step scores the last q tokens; a shorter sequence is padded in front. The
+                # padded rows and the ones already cached have a masked slot, and any id passes there.
+                expected_pos = [max(0, p) for p in range(n - q, n)]
+                expected_ids = [token_ids[p] if s != -1 else step_ids[j] for j, (p, s) in enumerate(zip(range(n - q, n), step_slots))]
+                if step_slots[-1] == -1:
+                    raise Violation(f"seq {seq.seq_id}: the catch-up step does not write the newest token's draft KV")
+            if step_ids != expected_ids:
+                raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} inputs {step_ids} != {expected_ids}")
+            if step_pos != expected_pos or context_lens[i] != n:
+                raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} positions {step_pos} context_len {context_lens[i]} for {n} tokens")
             truth = prefix_hashes(token_ids, DRAFT_SEED)
             for j in range(q):
                 p = n - q + j
-                if slots[i * q + j] == -1:
-                    continue    # already cached
-                self.model._write(self.model.draft_kv, seq, p, slots[i * q + j], truth[p])
+                if step_slots[j] == -1:
+                    continue    # already cached, or padding
+                if p < 0:
+                    raise Violation(f"seq {seq.seq_id}: a padding row of the catch-up step writes slot {step_slots[j]}")
+                self.model._write(self.model.draft_kv, seq, p, step_slots[j], truth[p])
             for p in range(n):
                 if self.model.draft_kv[block_tables[i][p // bs] * bs + p % bs] != truth[p]:
                     raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} read wrong draft KV at position {p} (context_len {n})")
@@ -290,25 +301,24 @@ class FakeModel:
 
     def _propose(self, seqs, meta, token_ids, k):
         """Run the real ModelRunner.propose with the fake draft model on the prepared inputs, and
-        return the input ids with the k draft columns filled in. With k == 0 the draft model still
-        runs one step, which keeps its KV cache current."""
+        return the input ids with the k draft columns filled in."""
         draft_model = self.runner.draft_model
         draft_model.begin(seqs, token_ids)
         set_context(False, slot_mapping=torch.tensor(meta["slot_mapping"], dtype=torch.int32),
                     context_lens=torch.tensor(meta["context_lens"], dtype=torch.int32),
                     block_tables=torch.tensor(meta["block_tables"], dtype=torch.int32))
         self.runner.draft_inputs = tuple(torch.tensor(t) for t in meta["draft_inputs"])
-        ids = self.runner.propose(torch.tensor(meta["input_ids"], dtype=torch.int64)).tolist()
+        ids = self.runner.propose(torch.tensor(meta["input_ids"], dtype=torch.int64), torch.tensor(meta["positions"], dtype=torch.int64)).tolist()
         c = get_context()
         if c.is_prefill or c.context_lens.tolist() != meta["context_lens"] or c.slot_mapping.tolist() != meta["slot_mapping"]:
             raise Violation("propose did not restore the target's context")
         reset_context()
         for i, seq in enumerate(seqs):
-            if len(draft_model.drafts[i]) != max(k, 1):
-                raise Violation(f"seq {seq.seq_id}: the draft model ran {len(draft_model.drafts[i])} steps, not {max(k, 1)}")
-            if ids[i * (k + 1) + 1:(i + 1) * (k + 1)] != draft_model.drafts[i][:k]:
-                raise Violation(f"seq {seq.seq_id}: draft inputs {ids[i * (k + 1) + 1:(i + 1) * (k + 1)]} != proposed {draft_model.drafts[i][:k]}")
-        return ids, [drafts[:k] for drafts in draft_model.drafts]
+            if len(draft_model.drafts[i]) != k:
+                raise Violation(f"seq {seq.seq_id}: the draft model ran {len(draft_model.drafts[i])} steps, not {k}")
+            if ids[i * (k + 1) + 1:(i + 1) * (k + 1)] != draft_model.drafts[i]:
+                raise Violation(f"seq {seq.seq_id}: draft inputs {ids[i * (k + 1) + 1:(i + 1) * (k + 1)]} != proposed {draft_model.drafts[i]}")
+        return ids, draft_model.drafts
 
     def _decode(self, seqs, meta):
         bs = self.block_size
@@ -331,15 +341,29 @@ class FakeModel:
                     raise Violation(f"seq {seq.seq_id}: {seq.num_inflight} tokens in flight but no step produced them")
                 token_ids += inflight if isinstance(inflight, list) else [inflight]
             all_token_ids.append(token_ids)
-        if self.draft_kv:
-            draft_ids, draft_pos, draft_slots = meta["draft_inputs"]
-            kd = max(q - 1, 1)    # draft steps: one even without drafts
+        if self.draft_kv and q == 1:    # a step without drafts leaves the draft model alone
+            if meta["draft_inputs"] is not None:
+                raise Violation("draft inputs prepared for a step without drafts")
+            all_drafts = [[] for _ in seqs]
+        elif self.draft_kv:
+            # The catch-up inputs: the last m tokens of every sequence (m >= 2), padded in front for a
+            # shorter sequence, each at its position and slot, with the slot masked for a cached or
+            # padding token. Whether every token the draft cache lacks is among them shows when the
+            # fake draft model reads its cache (FakeDraftModel.__call__).
+            catchup_ids, catchup_pos, catchup_slots = meta["draft_inputs"]
+            m = len(catchup_ids[0])
+            if m < 2 or any(len(row) != m for row in catchup_ids + catchup_pos + catchup_slots):
+                raise Violation(f"catch-up inputs for {m} tokens per sequence: {catchup_ids} {catchup_pos} {catchup_slots}")
             for i, seq in enumerate(seqs):
                 n = len(all_token_ids[i])
-                if draft_ids[i] != all_token_ids[i][-2:] or draft_pos[i] != list(range(n - 2, n + kd - 1)):
-                    raise Violation(f"seq {seq.seq_id}: draft inputs {draft_ids[i]} at {draft_pos[i]} for {n} tokens")
-                if draft_slots[i][1:] != slots[i * q:i * q + kd]:
-                    raise Violation(f"seq {seq.seq_id}: draft slots {draft_slots[i]} vs target slots {slots[i * q:(i + 1) * q]}")
+                if catchup_pos[i] != [max(0, p) for p in range(n - m, n)]:
+                    raise Violation(f"seq {seq.seq_id}: catch-up positions {catchup_pos[i]} for {n} tokens")
+                for j, s in enumerate(catchup_slots[i]):
+                    p = n - m + j
+                    if s == -1:
+                        continue
+                    if p < 0 or s != block_tables[i][p // bs] * bs + p % bs or catchup_ids[i][j] != all_token_ids[i][p]:
+                        raise Violation(f"seq {seq.seq_id}: catch-up token {catchup_ids[i][j]} at position {p} with slot {s}")
             ids, all_drafts = self._propose(seqs, meta, all_token_ids, q - 1)
         else:
             all_drafts = [seq.draft_token_ids for seq in seqs]
@@ -473,7 +497,7 @@ def run_engine(engine, requests, max_steps=50000):
         for seq in live_seqs:
             # Every full block of valid KV is registered for prefix caching, except the one the
             # draft model has not caught up on yet.
-            num_valid = seq.num_cached_tokens - inflight.get(seq, 0) - seq.draft_cache_lags
+            num_valid = min(seq.num_cached_tokens, seq.num_draft_cached_tokens) - inflight.get(seq, 0)
             num_hashed = sum((i + 1) * seq.block_size <= num_valid for i in range(len(seq.block_table)))
             if any(scheduler.block_manager.blocks[block_id].hash == -1 for block_id in seq.block_table[:num_hashed]):
                 raise Violation(f"seq {seq.seq_id}: a full block with valid KV is not hashed")

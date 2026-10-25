@@ -27,7 +27,7 @@ class Sequence:
         self.num_inflight = 0       # tokens the step still on the GPU may add (async scheduling): 1, or 1 + num_speculative_tokens
         self.inflight_row = -1      # row of this sequence in the in-flight step's output
         self.draft_token_ids = []   # tokens proposed for this decode step (speculative decoding with n-gram drafts)
-        self.draft_cache_lags = False   # the draft model's KV cache lacks the newest cached token (see Scheduler.postprocess)
+        self.num_draft_cached_tokens = 0    # positions a draft model's KV cache holds; it may lag num_cached_tokens (see Scheduler.postprocess)
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -77,11 +77,12 @@ class Sequence:
         if self.is_prefill:
             last_state = self.token_ids[self.num_cached_tokens:self.num_cached_tokens + self.num_scheduled_tokens]
         else:
-            last_state = tuple(self.token_ids[-2:])    # a draft model scores the last two tokens
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, self.draft_cache_lags, last_state)
+            # The last two tokens, and every one a draft model has not cached yet (ModelRunner.prepare_decode_with_draft_model).
+            last_state = tuple(self.token_ids[max(0, min(self.num_draft_cached_tokens, self.num_tokens - 2)):])
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, self.num_draft_cached_tokens, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, self.draft_cache_lags, last_state = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_inflight, self.inflight_row, self.block_table, self.draft_token_ids, self.num_draft_cached_tokens, last_state = state
         if isinstance(last_state, list):
             self.token_ids = [0] * self.num_cached_tokens + last_state
         else:

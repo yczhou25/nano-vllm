@@ -248,9 +248,10 @@ class ModelRunner:
     def prepare_decode_with_draft_model(self, seqs: list[Sequence]):
         """Decode inputs for speculative decoding with a draft model, computed on the GPU: with
         async scheduling the number of tokens the in-flight step added, and so every position, is
-        only known there. Also prepares the draft model's inputs (see propose)."""
+        only known there. In a step with drafts also prepares the draft model's catch-up inputs
+        (see propose): the tokens its KV cache lacks, many after steps without drafts."""
         k = seqs[0].num_scheduled_tokens - 1    # drafts in this step: num_speculative_tokens, or 0 for a large batch
-        kd = max(k, 1)                          # draft steps: the first runs even without drafts, to keep the draft KV cache current
+        K = self.num_speculative_tokens
         block_size = self.block_size
 
         def to_cuda(values, dtype):
@@ -258,10 +259,9 @@ class ModelRunner:
 
         num_tokens = to_cuda([len(seq) for seq in seqs], torch.int64)    # as known on the CPU
         last_token = to_cuda([seq.last_token for seq in seqs], torch.int64)
-        prev_token = to_cuda([seq.token_ids[-2:][0] for seq in seqs], torch.int64)
-        lags = to_cuda([seq.draft_cache_lags for seq in seqs], torch.bool)
         block_tables = self.prepare_block_tables(seqs)
         inflight_rows = [seq.inflight_row if seq.num_inflight else -1 for seq in seqs]
+        output = None
         if any(row >= 0 for row in inflight_rows):
             # The in-flight step's output: per sequence its accepted tokens, then -1.
             inflight_rows = to_cuda(inflight_rows, torch.int64)
@@ -269,22 +269,36 @@ class ModelRunner:
             num_inflight = torch.where(inflight_rows >= 0, (output >= 0).sum(dim=1), 0)
             num_tokens = num_tokens + num_inflight
             newest = output.gather(1, (num_inflight - 1).clamp_min(0).unsqueeze(1)).squeeze(1)
-            second_newest = output.gather(1, (num_inflight - 2).clamp_min(0).unsqueeze(1)).squeeze(1)
-            prev_token = torch.where(num_inflight >= 2, second_newest, torch.where(num_inflight == 1, last_token, prev_token))
             last_token = torch.where(num_inflight >= 1, newest, last_token)
-            lags = torch.where(inflight_rows >= 0, num_inflight == k + 1, lags)
         # The target scores the newest token and k drafts (propose fills them in) at positions
         # num_tokens - 1 .. num_tokens + k - 1.
         positions = (num_tokens - 1).unsqueeze(1) + torch.arange(k + 1, device=num_tokens.device)
         slot_mapping = (block_tables.gather(1, positions // block_size) * block_size + positions % block_size).to(torch.int32)
         input_ids = torch.cat([last_token.unsqueeze(1), torch.zeros_like(positions[:, 1:])], dim=1)
-        # The draft model first scores the last two tokens at positions num_tokens - 2 and
-        # num_tokens - 1, then each draft it produces. The second-to-last token is usually in its
-        # KV cache already; its slot is masked then so that no hashed block is written.
-        draft_positions = (num_tokens - 2).unsqueeze(1) + torch.arange(kd + 1, device=num_tokens.device)
-        prev_slot = (block_tables.gather(1, draft_positions[:, :1] // block_size) * block_size + draft_positions[:, :1] % block_size).to(torch.int32)
-        draft_slot_mapping = torch.cat([torch.where(lags.unsqueeze(1), prev_slot, -1), slot_mapping[:, :kd]], dim=1)
-        self.draft_inputs = torch.stack([prev_token, last_token], dim=1), draft_positions, draft_slot_mapping
+        self.draft_inputs = None
+        if k:
+            # Before drafting, the draft model catches up on the tokens its KV cache lacks: the
+            # newest one, the last draft of a fully accepted step, and everything sampled in steps
+            # without drafts (see Scheduler.postprocess). It scores the last m tokens of every
+            # sequence, m being the most any of them lacks (at least 2, which a CUDA graph covers);
+            # tokens it has cached get a masked slot, and a sequence shorter than m is padded in
+            # front. With async scheduling the in-flight step's tokens are appended on the GPU.
+            cached = [seq.num_draft_cached_tokens for seq in seqs]
+            m = max([2] + [2 if seq.num_inflight == 1 + K else len(seq) + seq.num_inflight - c for seq, c in zip(seqs, cached)])
+            tail = to_cuda([([0] * m + seq.token_ids[c:])[-m:] for seq, c in zip(seqs, cached)], torch.int64)
+            cached = to_cuda(cached, torch.int64)
+            if output is not None:
+                # An in-flight step with drafts caught up itself; afterwards its draft cache lacks
+                # the newest token, and the last draft too when all of them were accepted.
+                spec_inflight = to_cuda([seq.num_inflight == 1 + K for seq in seqs], torch.bool)
+                cached = torch.where(spec_inflight, num_tokens - 1 - (num_inflight == K + 1).long(), cached)
+                tokens = torch.cat([tail, output.clamp_min(0)], dim=1)
+                tail = tokens.gather(1, num_inflight.unsqueeze(1) + torch.arange(m, device=tokens.device))
+            catchup_positions = (num_tokens - m).unsqueeze(1) + torch.arange(m, device=num_tokens.device)
+            padded_positions = catchup_positions.clamp_min(0)
+            catchup_slots = block_tables.gather(1, padded_positions // block_size) * block_size + padded_positions % block_size
+            catchup_slots = torch.where(catchup_positions >= cached.unsqueeze(1), catchup_slots, -1).to(torch.int32)
+            self.draft_inputs = tail, padded_positions, catchup_slots
         set_context(False, slot_mapping=slot_mapping.view(-1), context_lens=(num_tokens + k).to(torch.int32), block_tables=block_tables)
         return input_ids.view(-1), positions.view(-1)
 
@@ -323,26 +337,29 @@ class ModelRunner:
         return self.model.compute_logits(self.forward(self.model, graphs, outputs, input_ids, positions, is_prefill))
 
     @torch.inference_mode()
-    def propose(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def propose(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Run the draft model k times and write its greedy tokens into the draft columns of
         input_ids (one row of batch_size * (k + 1)). The proposals are deterministic given the
-        context, so RejectionSampler stays exact. In a step without drafts (k == 0, a large batch)
-        the first draft step still runs, so that the draft KV cache keeps up with the target's."""
+        context, so RejectionSampler stays exact. The first step scores the tokens the draft KV
+        cache lacks (see prepare_decode_with_draft_model) and proposes from the newest token's
+        logits; each later step scores the draft just proposed."""
         context = get_context()    # the target's
         context_lens, block_tables = context.context_lens, context.block_tables
-        draft_input_ids, draft_positions, draft_slot_mapping = self.draft_inputs
-        bs = draft_input_ids.size(0)
+        tokens, catchup_positions, catchup_slots = self.draft_inputs
+        bs, m = tokens.shape
         k = input_ids.numel() // bs - 1
         input_ids = input_ids.view(bs, k + 1)
-        tokens = draft_input_ids.view(-1)
-        for i in range(max(k, 1)):
-            cols = slice(0, 2) if i == 0 else slice(i + 1, i + 2)
-            q = cols.stop - cols.start    # tokens per sequence in this draft step
-            set_context(False, slot_mapping=draft_slot_mapping[:, cols].reshape(-1), context_lens=context_lens - k + i, block_tables=block_tables)
-            graphs, outputs = (self.draft_graphs[q], self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
-            hidden_states = self.forward(self.draft_model, graphs, outputs, tokens, draft_positions[:, cols].reshape(-1), False)
-            if i == k:    # k == 0: the step only wrote the newest token's draft KV
-                break
+        positions = positions.view(bs, k + 1)
+        slot_mapping = context.slot_mapping.view(bs, k + 1)
+        for i in range(k):
+            if i == 0:
+                q, step_positions, step_slots = m, catchup_positions, catchup_slots
+            else:    # the newest draft, at the position the target scores it
+                q, step_positions, step_slots = 1, positions[:, i], slot_mapping[:, i]
+            set_context(False, slot_mapping=step_slots.reshape(-1), context_lens=context_lens - k + i, block_tables=block_tables)
+            # Graphs exist for 1 and 2 tokens per sequence; a longer catch-up, after steps without drafts, runs eagerly.
+            graphs, outputs = (self.draft_graphs.get(q), self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
+            hidden_states = self.forward(self.draft_model, graphs, outputs, tokens.reshape(-1), step_positions.reshape(-1), False)
             logits = self.draft_model.compute_logits(hidden_states[q - 1::q])
             tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")
             if self.world_size > 1:
@@ -352,14 +369,14 @@ class ModelRunner:
         return input_ids.view(-1)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
+        k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        if self.draft_model is not None and not is_prefill:
-            input_ids = self.propose(input_ids)
+        if self.draft_model is not None and k:
+            input_ids = self.propose(input_ids, positions)
         logits = self.run_model(input_ids, positions, is_prefill)
         if self.draft_model is not None and is_prefill:
             self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
-        k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
         token_ids = None
         if self.rank == 0 and not k:
             token_ids = self.sampler(logits, temperatures).tolist()
@@ -375,8 +392,8 @@ class ModelRunner:
         k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        if self.draft_model is not None and not is_prefill:
-            input_ids = self.propose(input_ids)
+        if self.draft_model is not None and k:
+            input_ids = self.propose(input_ids, positions)
         logits = self.run_model(input_ids, positions, is_prefill)
         if self.draft_model is not None and is_prefill:
             self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
