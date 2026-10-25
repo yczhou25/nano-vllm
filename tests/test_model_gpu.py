@@ -39,6 +39,10 @@ ENGINE_OPTIONS = {
     "async_draft": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL},
     # Drafts only while at most 2 sequences run: the 4 questions decode without them, the 2 documents with them.
     "draft_adaptive": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_disable_by_batch_size": 2},
+    # Acceptance switch: n-gram drafts of the questions are mostly rejected, so decode runs mostly without them,
+    # with a probe step now and then; the draft model's are mostly accepted (always, when it is the target itself).
+    "spec_acceptance": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5},
+    "draft_acceptance": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.5},
 }
 
 

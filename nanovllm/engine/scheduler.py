@@ -7,6 +7,12 @@ from nanovllm.engine.ngram import NgramProposer
 
 
 class Scheduler:
+    # The acceptance switch (speculative_min_acceptance) follows the acceptance rate over about the
+    # last ACCEPTANCE_WINDOW drafts. While it is below the threshold, decode steps run without drafts,
+    # except one probe step with drafts every PROBE_INTERVAL steps, which is how drafts come back
+    # once the workload changes.
+    ACCEPTANCE_WINDOW = 256    # drafts
+    PROBE_INTERVAL = 16        # decode steps
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
@@ -17,6 +23,10 @@ class Scheduler:
         self.num_speculative_tokens = config.num_speculative_tokens
         self.has_draft_model = config.speculative_model is not None    # the model runner drafts on the GPU
         self.speculative_disable_by_batch_size = config.speculative_disable_by_batch_size
+        self.speculative_min_acceptance = config.speculative_min_acceptance
+        self.acceptance = 1.0    # draft acceptance rate over about the last ACCEPTANCE_WINDOW drafts; drafts are trusted until measured
+        self.num_acceptance_drafts = 0    # drafts behind self.acceptance, capped at ACCEPTANCE_WINDOW
+        self.num_steps_without_drafts = 0    # consecutive decode steps without drafts, for the probe
         self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens and not self.has_draft_model else None
         self.num_draft_tokens = self.num_accepted_tokens = 0    # speculative decoding statistics
         self.waiting: deque[Sequence] = deque()
@@ -65,6 +75,9 @@ class Scheduler:
         k = self.num_speculative_tokens
         if k and self.speculative_disable_by_batch_size is not None and len(self.running) > self.speculative_disable_by_batch_size:
             k = 0    # a batch this large keeps the GPU busy by itself; the k extra positions would not be free
+        if k and self.speculative_min_acceptance is not None and self.acceptance < self.speculative_min_acceptance \
+                and self.num_steps_without_drafts < self.PROBE_INTERVAL:
+            k = 0    # drafts are rejected too often to pay for themselves; the next probe step measures again
         num_decode_tokens = 1 + k
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -87,6 +100,8 @@ class Scheduler:
                 scheduled_seqs.append(seq)
                 kept_seqs.append(seq)
         self.running.extendleft(reversed(kept_seqs))
+        if scheduled_seqs:
+            self.num_steps_without_drafts = 0 if k else self.num_steps_without_drafts + 1
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
@@ -121,6 +136,7 @@ class Scheduler:
         """token_ids has one token per sequence, or with speculative decoding, a list per decoded
         sequence: its accepted draft tokens followed by one sampled token."""
         finished = []
+        num_drafts = num_accepted = 0    # this step's drafts and how many were accepted
         for (seq, is_prefill, start, num_tokens, num_inflight), new_token_ids in zip(batch, token_ids):
             if seq.is_finished:    # finished while this step was in flight
                 continue
@@ -149,8 +165,8 @@ class Scheduler:
                         lag = self.has_draft_model and len(new_token_ids) == self.num_speculative_tokens + 1
                         seq.num_draft_cached_tokens = seq.num_cached_tokens - lag
                 if speculative:
-                    self.num_draft_tokens += self.num_speculative_tokens
-                    self.num_accepted_tokens += len(new_token_ids) - 1
+                    num_drafts += self.num_speculative_tokens
+                    num_accepted += len(new_token_ids) - 1
             if seq.block_table:    # empty if preempted while this step was in flight
                 # Blocks both KV caches hold completely; the ones a lagging draft cache left for later are hashed
                 # once it catches up (hash_blocks scans back to them).
@@ -166,4 +182,12 @@ class Scheduler:
                 if self.proposer:
                     self.proposer.forget(seq)
                 finished.append(seq)
+        if num_drafts:
+            self.num_draft_tokens += num_drafts
+            self.num_accepted_tokens += num_accepted
+            # A running mean over about the last ACCEPTANCE_WINDOW drafts: a plain mean until that many
+            # were seen, then each step's drafts replace that share of the window.
+            seen = min(self.num_acceptance_drafts, self.ACCEPTANCE_WINDOW)
+            self.acceptance = (self.acceptance * seen + num_accepted) / (seen + num_drafts)
+            self.num_acceptance_drafts = min(seen + num_drafts, self.ACCEPTANCE_WINDOW)
         return finished

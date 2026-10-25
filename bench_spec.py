@@ -24,15 +24,18 @@ QUESTIONS = [
 
 
 def build_prompts(tokenizer, workload, num_prompts, max_prompt_tokens):
+    files = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanovllm", "**", "*.py"), recursive=True))
+    edits = []
+    for path in files:
+        source = open(path).read().strip()
+        if source and len(tokenizer.encode(source)) <= max_prompt_tokens:
+            edits.append(f"Add a one-line docstring to every function and class in this file. Reply with the complete file and nothing else.\n\n```python\n{source}\n```")
     if workload == "edit":
-        files = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanovllm", "**", "*.py"), recursive=True))
-        texts = []
-        for path in files:
-            source = open(path).read().strip()
-            if source and len(tokenizer.encode(source)) <= max_prompt_tokens:
-                texts.append(f"Add a one-line docstring to every function and class in this file. Reply with the complete file and nothing else.\n\n```python\n{source}\n```")
-    else:
+        texts = edits
+    elif workload == "chat":
         texts = QUESTIONS
+    else:    # mixed: edit and chat prompts alternate, so every batch holds both
+        texts = [text for pair in zip(edits, QUESTIONS) for text in pair]
     texts = [texts[i % len(texts)] for i in range(num_prompts)]
     return [tokenizer.apply_chat_template([{"role": "user", "content": t}], tokenize=True, add_generation_prompt=True, enable_thinking=False) for t in texts]
 
@@ -40,7 +43,7 @@ def build_prompts(tokenizer, workload, num_prompts, max_prompt_tokens):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
-    parser.add_argument("--workload", choices=["edit", "chat"], default="edit")
+    parser.add_argument("--workload", choices=["edit", "chat", "mixed"], default="edit", help="mixed alternates edit and chat prompts")
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
     parser.add_argument("--speculative-model", default=None, help="draft model directory; n-gram drafts if omitted")
     parser.add_argument("--batch-size", type=int, default=1, help="requests per generate call")
@@ -51,10 +54,11 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument("--speculative-disable-by-batch-size", type=int, default=None, help="decode without drafts while more sequences than this are running")
+    parser.add_argument("--speculative-min-acceptance", type=float, default=None, help="decode without drafts while the measured acceptance rate is below this")
     args = parser.parse_args()
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,
-              speculative_model=args.speculative_model)
+              speculative_model=args.speculative_model, speculative_min_acceptance=args.speculative_min_acceptance)
     prompts = build_prompts(llm.tokenizer, args.workload, args.num_prompts, args.max_prompt_tokens)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
     llm.generate(prompts[:1], SamplingParams(max_tokens=16), use_tqdm=False)    # warmup
@@ -69,7 +73,7 @@ def main():
     t = time.perf_counter() - t
     acceptance = scheduler.num_accepted_tokens / scheduler.num_draft_tokens if scheduler.num_draft_tokens else 0.0
     drafter = "none" if not args.num_speculative_tokens else "model" if args.speculative_model else "ngram"
-    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} batch={args.batch_size} T={args.temperature} "
+    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} batch={args.batch_size} T={args.temperature} "
           f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f}")
 
 

@@ -39,12 +39,12 @@ class Violation(AssertionError):
 
 
 def make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, eos=EOS, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None):
     # Config itself requires a model directory and block sizes that are multiples of 256.
     return types.SimpleNamespace(num_kvcache_blocks=num_blocks, kvcache_block_size=block_size,
                                  max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens, eos=eos,
                                  num_speculative_tokens=num_speculative_tokens, speculative_model="fake" if draft_model else None,
-                                 speculative_disable_by_batch_size=speculative_disable_by_batch_size)
+                                 speculative_disable_by_batch_size=speculative_disable_by_batch_size, speculative_min_acceptance=speculative_min_acceptance)
 
 
 def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
@@ -62,12 +62,13 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
 
 
 def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None):
     assert not (async_scheduling and num_speculative_tokens and not draft_model)
     engine = LLMEngine.__new__(LLMEngine)
     engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens,
                                              num_speculative_tokens=num_speculative_tokens, draft_model=draft_model,
-                                             speculative_disable_by_batch_size=speculative_disable_by_batch_size))
+                                             speculative_disable_by_batch_size=speculative_disable_by_batch_size,
+                                             speculative_min_acceptance=speculative_min_acceptance))
     engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks, num_speculative_tokens=num_speculative_tokens, draft_model=draft_model)
     engine.async_scheduling = async_scheduling
     engine.pending = None
@@ -93,9 +94,10 @@ def next_token(token_ids, h):
     return r % VOCAB
 
 
-def draft_next_token(token_ids, h, draft_h):
-    """The fake draft model's guess after token_ids: the target's next token most of the time."""
-    return next_token(token_ids, h) if (draft_h >> 9) % 4 else draft_h % VOCAB
+def draft_next_token(token_ids, h, draft_h, miss_mod=4):
+    """The fake draft model's guess after token_ids: the target's next token, except one time in
+    miss_mod (miss_mod=1: never the target's, so the drafts are rejected)."""
+    return next_token(token_ids, h) if (draft_h >> 9) % miss_mod else draft_h % VOCAB
 
 
 def reference(prompt, sp: SamplingParams):
@@ -195,7 +197,7 @@ class FakeDraftModel:
             for p in range(n):
                 if self.model.draft_kv[block_tables[i][p // bs] * bs + p % bs] != truth[p]:
                     raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} read wrong draft KV at position {p} (context_len {n})")
-            draft = draft_next_token(token_ids, prefix_hashes(token_ids)[-1], truth[-1])
+            draft = draft_next_token(token_ids, prefix_hashes(token_ids)[-1], truth[-1], self.model.draft_miss_mod(token_ids))
             drafts.append(draft)
             token_ids.append(draft)
             outputs.extend([-1] * (q - 1) + [draft])    # only the last row of each sequence is scored
@@ -225,6 +227,8 @@ class FakeModel:
         self.block_manager = scheduler.block_manager
         self.check_tp = check_tp
         self.num_speculative_tokens = num_speculative_tokens
+        self.mixed_draft_quality = False    # see draft_miss_mod
+        self.steps_without_drafts = 0       # consecutive decode steps without drafts (acceptance switch)
         self.rejection_sampler = RejectionSampler()
         self.last_outputs = {}
         self.num_samples = collections.Counter()    # tokens sampled per seq, kept or not
@@ -232,6 +236,14 @@ class FakeModel:
         self.prefix_hashes = {}                     # seq_id -> prefix hashes of its tokens so far
         self.draft_prefix_hashes = {}
         self.checked_blocks = set()                 # (block_id, hash) pairs whose KV was checked
+
+    def draft_miss_mod(self, token_ids):
+        """How often the fake draft model misses: one draft in four, or with mixed_draft_quality one in
+        eight for prompts starting with an even token and every one for the others, so the batch's
+        acceptance rate swings with its mix and the acceptance switch flips both ways."""
+        if not self.mixed_draft_quality:
+            return 4
+        return 8 if token_ids[0] % 2 == 0 else 1
 
     def call(self, method_name, seqs, is_prefill):
         token_ids = self.run(seqs, is_prefill)
@@ -327,8 +339,17 @@ class FakeModel:
         q = seqs[0].num_scheduled_tokens    # 1 + the drafts in this step: none when the batch is large
         if any(seq.num_scheduled_tokens != q for seq in seqs) or q - 1 not in (0, self.num_speculative_tokens):
             raise Violation(f"decode step with {[seq.num_scheduled_tokens for seq in seqs]} tokens per sequence")
-        if self.scheduler.speculative_disable_by_batch_size is None and q != 1 + self.num_speculative_tokens:
+        scheduler = self.scheduler
+        if scheduler.speculative_disable_by_batch_size is None and scheduler.speculative_min_acceptance is None and q != 1 + self.num_speculative_tokens:
             raise Violation(f"decode step with {q} tokens per sequence, expected {1 + self.num_speculative_tokens}")
+        if scheduler.speculative_min_acceptance is not None and scheduler.speculative_disable_by_batch_size is None:
+            # The acceptance switch alone decides: drafts are off only while the measured acceptance is
+            # below the threshold, and never for more than PROBE_INTERVAL steps in a row.
+            if q == 1 and scheduler.acceptance >= scheduler.speculative_min_acceptance:
+                raise Violation(f"drafts switched off at acceptance {scheduler.acceptance:.3f} >= {scheduler.speculative_min_acceptance}")
+            self.steps_without_drafts = self.steps_without_drafts + 1 if q == 1 else 0
+            if self.steps_without_drafts > scheduler.PROBE_INTERVAL:
+                raise Violation(f"{self.steps_without_drafts} decode steps without drafts: no probe step after {scheduler.PROBE_INTERVAL}")
         if len(ids) != q * len(seqs):
             raise Violation(f"{len(ids)} decode inputs for {len(seqs)} seqs, expected {q} each")
         # Each sequence's tokens, including those of the step still in flight (async scheduling).
@@ -553,7 +574,14 @@ def random_requests(rng, block_size, capacity, pressure):
     return requests
 
 
-def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False):
+def set_acceptance_switch(engine, rng):
+    """A short window and probe interval, so the switch flips many times within a case."""
+    engine.scheduler.ACCEPTANCE_WINDOW = rng.randint(2, 40)
+    engine.scheduler.PROBE_INTERVAL = rng.randint(1, 6)
+    engine.model_runner.mixed_draft_quality = True
+
+
+def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False):
     rng = random.Random(seed)
     bs = rng.choice([2, 3, 4, 8])
     Sequence.block_size = bs
@@ -564,8 +592,12 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
     max_num_seqs = rng.randint(1, 8)
     max_num_batched_tokens = max(1, rng.choice([1, 2, bs - 1, bs, bs + 1, 2 * bs, 3 * bs + 1, rng.randint(1, 10 * bs), 10 ** 6]))
     # Adaptive: drafts only while at most 1-3 sequences run, so steps with and without drafts alternate.
+    # Acceptance: drafts switched off while too many are rejected (half the requests get good drafts).
     engine = make_engine(num_blocks, bs, max_num_seqs, max_num_batched_tokens, async_scheduling, num_speculative_tokens, draft_model,
-                         speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None)
+                         speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
+                         speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None)
+    if acceptance:
+        set_acceptance_switch(engine, rng)
     requests = random_requests(rng, bs, num_blocks * bs - num_speculative_tokens, pressure)
     outputs = run_engine(engine, requests)
     for i, (_, prompt, sp) in enumerate(requests):
@@ -574,7 +606,7 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
             raise Violation(f"request {i}: output {outputs.get(i)} != reference {expected}")
 
 
-def run_random_case_block_256(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False):
+def run_random_case_block_256(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False):
     """Same checks with the default block size and realistic token budgets."""
     rng = random.Random(seed)
     bs = 256
@@ -583,7 +615,10 @@ def run_random_case_block_256(seed, async_scheduling=False, num_speculative_toke
     capacity = num_blocks * bs - num_speculative_tokens
     max_num_batched_tokens = rng.choice([256, 300, 511, 512, 1000, 16384])
     engine = make_engine(num_blocks, bs, rng.randint(1, 6), max_num_batched_tokens, async_scheduling, num_speculative_tokens, draft_model,
-                         speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None)
+                         speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
+                         speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None)
+    if acceptance:
+        set_acceptance_switch(engine, rng)
     base = [rng.randrange(1, VOCAB) for _ in range(1200)]
     requests = []
     for _ in range(rng.randint(2, 6)):
