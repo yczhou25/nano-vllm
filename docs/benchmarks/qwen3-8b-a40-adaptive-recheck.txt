@@ -1,0 +1,10 @@
+workload=edit drafter=none k=0 async=0 disable_by=None batch=32 T=0.0 tokens=25279 time=42.76s throughput=591.2tok/s acceptance=0.000
+workload=edit drafter=model k=4 async=0 disable_by=None batch=32 T=0.0 tokens=25269 time=29.39s throughput=859.7tok/s acceptance=0.852
+workload=edit drafter=model k=4 async=0 disable_by=8 batch=32 T=0.0 tokens=25265 time=43.69s throughput=578.2tok/s acceptance=0.000
+workload=edit drafter=model k=4 async=1 disable_by=8 batch=32 T=0.0 tokens=25264 time=44.42s throughput=568.8tok/s acceptance=0.000
+workload=chat drafter=none k=0 async=0 disable_by=None batch=32 T=0.0 tokens=31064 time=35.40s throughput=877.4tok/s acceptance=0.000
+workload=chat drafter=model k=4 async=0 disable_by=None batch=32 T=0.0 tokens=31320 time=32.52s throughput=963.2tok/s acceptance=0.402
+workload=chat drafter=model k=4 async=0 disable_by=8 batch=32 T=0.0 tokens=31360 time=35.86s throughput=874.5tok/s acceptance=0.000
+workload=chat drafter=model k=4 async=1 disable_by=8 batch=32 T=0.0 tokens=31360 time=35.27s throughput=889.1tok/s acceptance=0.000
+workload=edit drafter=model k=4 async=0 disable_by=None batch=8 T=0.0 tokens=6717 time=16.82s throughput=399.4tok/s acceptance=0.860
+workload=edit drafter=model k=4 async=0 disable_by=8 batch=8 T=0.0 tokens=6698 time=17.17s throughput=390.0tok/s acceptance=0.852

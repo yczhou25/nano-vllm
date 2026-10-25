@@ -78,21 +78,24 @@ Measured on one NVIDIA A40 (bf16, CUDA graphs on). `bench.py` is upstream's thro
 |---|---|---|---|---|---|---|---|
 | edit, greedy | 1 | 33.4 | 94.3 (2.8x, acc 0.50) | 72.9 (2.2x, 0.93) | 96.4 (2.9x, 0.88) | 97.9 | 96.2 |
 | | 8 | 194.7 | 404.4 (2.1x, 0.52) | 280.5 (1.4x, 0.91) | 404.3 (2.1x, 0.86) | 409.1 | 391.2 |
-| | 32 | 592.7 | 923.1 (1.56x, 0.51) | 741.6 (1.25x, 0.91) | 859.0 (1.45x, 0.85) | 836.8 | 450.0 (0.76x) |
+| | 32 | 592.7 | 923.1 (1.56x, 0.51) | 741.6 (1.25x, 0.91) | 859.0 (1.45x, 0.85) | 836.8 | 578.2 (0.98x)† |
 | chat, greedy | 1 | 33.8 | 40.0 (1.18x, 0.05) | 56.1 (1.66x, 0.55) | 59.4 (1.76x, 0.41) | 60.6 | 60.1 |
 | | 8 | 250.1 | 237.2 (0.95x, 0.05) | 328.4 (1.31x, 0.57) | 346.5 (1.39x, 0.41) | 351.5 | 329.4 |
-| | 32 | 878.4 | 674.6 (0.77x, 0.05) | 1019.8 (1.16x, 0.55) | 965.3 (1.10x, 0.40) | 984.4 | 746.0 (0.85x) |
+| | 32 | 878.4 | 674.6 (0.77x, 0.05) | 1019.8 (1.16x, 0.55) | 965.3 (1.10x, 0.40) | 984.4 | 874.5 (1.00x)† |
 | edit, T=0.6 | 8 | 195.4 | 372.6 (1.91x, 0.50) | 328.1 (1.68x, 0.91) | 404.6 (2.07x, 0.87) | 404.5 | 393.5 |
 | chat, T=0.6 | 1 | 33.8 | 39.9 (1.18x, 0.05) | 55.9 (1.65x, 0.55) | 60.1 (1.78x, 0.42) | 60.7 | 60.6 |
 
 Also at batch 1, greedy: draft k=6 gives 109.0 tok/s on edit (3.3x, acceptance 0.82) and 56.5 on chat (acceptance 0.31). Async scheduling alone is within 2% of the baseline on 8B in every row. The GPU test suite (18 tests, every engine mode) passed on this model pair as well.
+
+† Re-measured in job 225388 after the draft-cache fix below (commit 5550679; raw rows in `docs/benchmarks/qwen3-8b-a40-adaptive-recheck.txt`), against that run's own baseline (591.2 on edit, 877.4 on chat). Before the fix, job 225010 measured 450.0 (0.76x) and 746.0 (0.85x) in these two cells.
 
 What the numbers say:
 
 - A 0.6B drafter speeds up the 8B model on every workload and batch tested: 2.9x on code editing and 1.8x on chat at batch 1, still 1.45x and 1.16x at batch 32. Sampling at T=0.6 costs nothing over greedy, so the rejection sampler is doing its job.
 - N-gram drafts are the honest worst case: 2.8x on code editing, where the output copies the input (acceptance 0.5), but useless on chat (acceptance 0.05), where they slow decoding down at batch 8 and 32.
 - Async scheduling gave +10% on Qwen3-0.6B and nothing measurable on Qwen3-8B: the CPU work it hides is a fixed few milliseconds per step, large next to a 0.6B forward pass and small next to an 8B one.
-- Adaptive speculation behaves as designed below its threshold (same numbers as draft k=4) but is *slower than the baseline* at batch 32 (0.76x on edit, 0.85x on chat), where it switches drafts off. The draft model still runs one step per decode step to keep its KV cache current, and that step reads the draft's whole KV cache, which for Qwen3-0.6B is 28 layers of the same per-layer size as the 8B's 36. Letting the draft cache lag while drafts are off, and catching it up when they resume, is the fix in progress; until then the option only pays off when the target is compute-bound.
+- Adaptive speculation behaves as designed below its threshold (same numbers as draft k=4) and now costs nothing above it: 0.98x on edit and 1.00x on chat at batch 32, where it switches drafts off (0.96x and 1.01x with async scheduling on top). Its first version measured 0.76x and 0.85x there, because the draft model still ran one step per decode step to keep its KV cache current, and that step reads the draft's whole KV cache, which for Qwen3-0.6B is 28 layers of the same per-layer size as the 8B's 36. The fix lets the draft cache lag while drafts are off and catches it up in one forward pass when they resume (the design note has the mutation table).
+- The threshold is the remaining lesson: on this A40 the 8B target is still memory-bound at batch 32, so leaving draft k=4 on (1.45x on edit, 1.10x on chat) beats switching it off at 8 sequences. The threshold belongs where the target turns compute-bound, and the better switch is measured acceptance: it would turn n-gram drafts off on chat (acceptance 0.05) and leave model drafts (0.40 to 0.85) on.
 
 ## Credits
 
