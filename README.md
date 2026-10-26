@@ -89,13 +89,24 @@ Also at batch 1, greedy: draft k=6 gives 109.0 tok/s on edit (3.3x, acceptance 0
 
 † Re-measured in job 225388 after the draft-cache fix below (commit 5550679; raw rows in `docs/benchmarks/qwen3-8b-a40-adaptive-recheck.txt`), against that run's own baseline (591.2 on edit, 877.4 on chat). Before the fix, job 225010 measured 450.0 (0.76x) and 746.0 (0.85x) in these two cells.
 
+**Adaptive k (job 228429, 2026-10-26, 53 min; raw rows in `docs/benchmarks/qwen3-8b-a40-adaptive-k.txt`).** `speculative_min_acceptance` picks each step's k from the measured acceptance rate of every draft position. Same models and A40; the baseline column is from job 225010, the other columns from this run, so read the speedups as approximate (runs of the same configuration differ by up to 10%: n-gram k=4 on chat at batch 32 measured 674.6 in 225010 and 763.8 here).
+
+| Workload | Batch | Baseline | Draft k=6, fixed | Draft K=6, `min_acceptance=0.3` | Draft K=4, `min_acceptance=0.2` |
+|---|---|---|---|---|---|
+| edit, greedy | 1 | 33.4 | 109.0 (3.3x, acc 0.82) | 123.9 (3.7x, 0.82) | |
+| | 32 | 592.7 | 818.7 (1.38x, 0.79) | 969.5 (1.64x, 0.79) | |
+| chat, greedy | 1 | 33.8 | 56.5 (1.67x, 0.31) | 60.1 (1.78x, 0.52) | |
+| | 32 | 878.4 | 868.6 (0.99x, 0.31) | 1104.8 (1.26x, 0.52) | 1108.2 (1.26x, 0.48) |
+
+With the draft model, adaptive k beats every fixed k measured: on chat at batch 32 it is 27% faster than fixed k=6 and 15% faster than fixed k=4 (965.3), because the later draft positions, accepted 31% of the time on average, are dropped and only re-probed every 16 steps. N-gram drafts with the switch keep their edit speedups (1002.8 at batch 32, 111.5 at batch 1) but did not get back to the no-draft baseline on chat (729.0 at batch 32, against 763.8 without the switch) or on a mixed edit+chat batch (727.2 against 842.9 without drafts; 871.6 against 925.6 with the draft model). Two causes were found in the code afterwards and fixed in 44129e2 (the samplers recompiled for every new (batch, k) shape inside the timed run, and at batch 32 the 64-sample acceptance window turned over every two steps), and one is a design limit: a step has one k for the whole batch, so a batch that mixes workloads gets the k of its average. The re-run with same-run baselines is the next job.
+
 What the numbers say:
 
 - A 0.6B drafter speeds up the 8B model on every workload and batch tested: 2.9x on code editing and 1.8x on chat at batch 1, still 1.45x and 1.16x at batch 32. Sampling at T=0.6 costs nothing over greedy, so the rejection sampler is doing its job.
 - N-gram drafts are the honest worst case: 2.8x on code editing, where the output copies the input (acceptance 0.5), but useless on chat (acceptance 0.05), where they slow decoding down at batch 8 and 32.
 - Async scheduling gave +10% on Qwen3-0.6B and nothing measurable on Qwen3-8B: the CPU work it hides is a fixed few milliseconds per step, large next to a 0.6B forward pass and small next to an 8B one.
 - Adaptive speculation behaves as designed below its threshold (same numbers as draft k=4) and now costs nothing above it: 0.98x on edit and 1.00x on chat at batch 32, where it switches drafts off (0.96x and 1.01x with async scheduling on top). Its first version measured 0.76x and 0.85x there, because the draft model still ran one step per decode step to keep its KV cache current, and that step reads the draft's whole KV cache, which for Qwen3-0.6B is 28 layers of the same per-layer size as the 8B's 36. The fix lets the draft cache lag while drafts are off and catches it up in one forward pass when they resume (the design note has the mutation table).
-- The threshold is the remaining lesson: on this A40 the 8B target is still memory-bound at batch 32, so leaving draft k=4 on (1.45x on edit, 1.10x on chat) beats switching it off at 8 sequences. The threshold belongs where the target turns compute-bound, and the better switch is measured acceptance: it would turn n-gram drafts off on chat (acceptance 0.05) and leave model drafts (0.40 to 0.85) on. `speculative_min_acceptance` is that switch, extended to pick `k` per step from each draft position's acceptance rate (position `j` is only accepted when the `j-1` before it were, so the rates fall with the position and the cut lands where they drop below the threshold); its A40 numbers are the next run.
+- The threshold is the remaining lesson: on this A40 the 8B target is still memory-bound at batch 32, so leaving draft k=4 on (1.45x on edit, 1.10x on chat) beats switching it off at 8 sequences. The threshold belongs where the target turns compute-bound, and the better switch is measured acceptance: it would turn n-gram drafts off on chat (acceptance 0.05) and leave model drafts (0.40 to 0.85) on. `speculative_min_acceptance` is that switch, extended to pick `k` per step from each draft position's acceptance rate (position `j` is only accepted when the `j-1` before it were, so the rates fall with the position and the cut lands where they drop below the threshold); the table above shows it finding 3.7x on edit and 1.26x on chat at batch 32 with one setting.
 
 ## Credits
 
