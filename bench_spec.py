@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument("--speculative-disable-by-batch-size", type=int, default=None, help="decode without drafts while more sequences than this are running")
-    parser.add_argument("--speculative-min-acceptance", type=float, default=None, help="decode without drafts while the measured acceptance rate is below this")
+    parser.add_argument("--speculative-min-acceptance", type=float, default=None, help="propose only the leading draft positions whose measured acceptance rate reaches this (down to none)")
     args = parser.parse_args()
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,

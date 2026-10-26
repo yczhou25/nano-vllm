@@ -250,8 +250,7 @@ class ModelRunner:
         async scheduling the number of tokens the in-flight step added, and so every position, is
         only known there. In a step with drafts also prepares the draft model's catch-up inputs
         (see propose): the tokens its KV cache lacks, many after steps without drafts."""
-        k = seqs[0].num_scheduled_tokens - 1    # drafts in this step: num_speculative_tokens, or 0 for a large batch
-        K = self.num_speculative_tokens
+        k = seqs[0].num_scheduled_tokens - 1    # drafts in this step: up to num_speculative_tokens, 0 for a large batch
         block_size = self.block_size
 
         def to_cuda(values, dtype):
@@ -284,14 +283,15 @@ class ModelRunner:
             # tokens it has cached get a masked slot, and a sequence shorter than m is padded in
             # front. With async scheduling the in-flight step's tokens are appended on the GPU.
             cached = [seq.num_draft_cached_tokens for seq in seqs]
-            m = max([2] + [2 if seq.num_inflight == 1 + K else len(seq) + seq.num_inflight - c for seq, c in zip(seqs, cached)])
+            m = max([2] + [2 if seq.num_inflight > 1 else len(seq) + seq.num_inflight - c for seq, c in zip(seqs, cached)])
             tail = to_cuda([([0] * m + seq.token_ids[c:])[-m:] for seq, c in zip(seqs, cached)], torch.int64)
             cached = to_cuda(cached, torch.int64)
             if output is not None:
                 # An in-flight step with drafts caught up itself; afterwards its draft cache lacks
                 # the newest token, and the last draft too when all of them were accepted.
-                spec_inflight = to_cuda([seq.num_inflight == 1 + K for seq in seqs], torch.bool)
-                cached = torch.where(spec_inflight, num_tokens - 1 - (num_inflight == K + 1).long(), cached)
+                spec_inflight = to_cuda([seq.num_inflight > 1 for seq in seqs], torch.bool)    # in flight: the newest token and its drafts
+                max_inflight = to_cuda([seq.num_inflight for seq in seqs], torch.int64)
+                cached = torch.where(spec_inflight, num_tokens - 1 - (num_inflight == max_inflight).long(), cached)
                 tokens = torch.cat([tail, output.clamp_min(0)], dim=1)
                 tail = tokens.gather(1, num_inflight.unsqueeze(1) + torch.arange(m, device=tokens.device))
             catchup_positions = (num_tokens - m).unsqueeze(1) + torch.arange(m, device=num_tokens.device)
@@ -449,9 +449,15 @@ class ModelRunner:
             block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32),
             outputs=torch.zeros(max_bs * q, hf_config.hidden_size),
         )
-        # Decode steps without drafts (a large batch, see Scheduler.schedule) need their own graphs.
+        # Decode steps without drafts (a large batch) or with fewer of them (adaptive k, see
+        # Scheduler.schedule) need their own graphs.
+        qs = {q}
+        if config.speculative_disable_by_batch_size is not None:
+            qs.add(1)
+        if config.speculative_min_acceptance is not None:
+            qs.update(range(1, q))
         self.graphs = {}
-        for q in sorted({q} | ({1} if config.speculative_disable_by_batch_size is not None else set())):
+        for q in sorted(qs):
             self.graphs[q] = self.capture_graphs(self.model, self.graph_vars["outputs"], q)
         self.draft_graphs = {}
         if self.draft_model is not None:

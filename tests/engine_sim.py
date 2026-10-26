@@ -197,7 +197,7 @@ class FakeDraftModel:
             for p in range(n):
                 if self.model.draft_kv[block_tables[i][p // bs] * bs + p % bs] != truth[p]:
                     raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} read wrong draft KV at position {p} (context_len {n})")
-            draft = draft_next_token(token_ids, prefix_hashes(token_ids)[-1], truth[-1], self.model.draft_miss_mod(token_ids))
+            draft = draft_next_token(token_ids, prefix_hashes(token_ids)[-1], truth[-1], self.model.draft_miss_mod(token_ids, len(drafts)))
             drafts.append(draft)
             token_ids.append(draft)
             outputs.extend([-1] * (q - 1) + [draft])    # only the last row of each sequence is scored
@@ -228,7 +228,7 @@ class FakeModel:
         self.check_tp = check_tp
         self.num_speculative_tokens = num_speculative_tokens
         self.mixed_draft_quality = False    # see draft_miss_mod
-        self.steps_without_drafts = 0       # consecutive decode steps without drafts (acceptance switch)
+        self.steps_without_probe = 0        # consecutive decode steps with fewer than K drafts (adaptive k)
         self.rejection_sampler = RejectionSampler()
         self.last_outputs = {}
         self.num_samples = collections.Counter()    # tokens sampled per seq, kept or not
@@ -237,13 +237,17 @@ class FakeModel:
         self.draft_prefix_hashes = {}
         self.checked_blocks = set()                 # (block_id, hash) pairs whose KV was checked
 
-    def draft_miss_mod(self, token_ids):
-        """How often the fake draft model misses: one draft in four, or with mixed_draft_quality one in
-        eight for prompts starting with an even token and every one for the others, so the batch's
-        acceptance rate swings with its mix and the acceptance switch flips both ways."""
+    def draft_miss_mod(self, token_ids, position):
+        """How often the fake draft model misses at draft position 0..K-1: one draft in four, or with
+        mixed_draft_quality every draft for prompts starting with an odd token and for the others one
+        in eight at the first position, one in four at the second and one in two after that, so the
+        batch's acceptance rates fall with the position, swing with its mix, and adaptive k moves
+        both ways and stops at every position."""
         if not self.mixed_draft_quality:
             return 4
-        return 8 if token_ids[0] % 2 == 0 else 1
+        if token_ids[0] % 2:
+            return 1
+        return (8, 4, 2)[min(position, 2)]
 
     def call(self, method_name, seqs, is_prefill):
         token_ids = self.run(seqs, is_prefill)
@@ -336,20 +340,29 @@ class FakeModel:
         bs = self.block_size
         ids, pos, slots = meta["input_ids"], meta["positions"], meta["slot_mapping"]
         context_lens, block_tables = meta["context_lens"], meta["block_tables"]
-        q = seqs[0].num_scheduled_tokens    # 1 + the drafts in this step: none when the batch is large
-        if any(seq.num_scheduled_tokens != q for seq in seqs) or q - 1 not in (0, self.num_speculative_tokens):
-            raise Violation(f"decode step with {[seq.num_scheduled_tokens for seq in seqs]} tokens per sequence")
         scheduler = self.scheduler
-        if scheduler.speculative_disable_by_batch_size is None and scheduler.speculative_min_acceptance is None and q != 1 + self.num_speculative_tokens:
-            raise Violation(f"decode step with {q} tokens per sequence, expected {1 + self.num_speculative_tokens}")
+        K = self.num_speculative_tokens
+        q = seqs[0].num_scheduled_tokens    # 1 + the drafts in this step: none when the batch is large, any number with adaptive k
+        allowed = range(K + 1) if scheduler.speculative_min_acceptance is not None else (0, K)
+        if any(seq.num_scheduled_tokens != q for seq in seqs) or q - 1 not in allowed:
+            raise Violation(f"decode step with {[seq.num_scheduled_tokens for seq in seqs]} tokens per sequence")
+        if scheduler.speculative_disable_by_batch_size is None and scheduler.speculative_min_acceptance is None and q != 1 + K:
+            raise Violation(f"decode step with {q} tokens per sequence, expected {1 + K}")
         if scheduler.speculative_min_acceptance is not None and scheduler.speculative_disable_by_batch_size is None:
-            # The acceptance switch alone decides: drafts are off only while the measured acceptance is
-            # below the threshold, and never for more than PROBE_INTERVAL steps in a row.
-            if q == 1 and scheduler.acceptance >= scheduler.speculative_min_acceptance:
-                raise Violation(f"drafts switched off at acceptance {scheduler.acceptance:.3f} >= {scheduler.speculative_min_acceptance}")
-            self.steps_without_drafts = self.steps_without_drafts + 1 if q == 1 else 0
-            if self.steps_without_drafts > scheduler.PROBE_INTERVAL:
-                raise Violation(f"{self.steps_without_drafts} decode steps without drafts: no probe step after {scheduler.PROBE_INTERVAL}")
+            # Adaptive k alone decides: a step proposes the leading draft positions whose measured
+            # acceptance rate reaches the threshold (computed here independently of the scheduler),
+            # except a probe step with all K positions after PROBE_INTERVAL steps without one. The
+            # scheduler's statistics are as they were when it scheduled this step: with async
+            # scheduling the previous step is post-processed after this one is launched.
+            expected = 0
+            while expected < K and scheduler.acceptance[expected + 1] >= scheduler.speculative_min_acceptance:
+                expected += 1
+            if self.steps_without_probe >= scheduler.PROBE_INTERVAL:
+                expected = K
+            if q - 1 != expected:
+                raise Violation(f"decode step with {q - 1} drafts, expected {expected} at acceptance {[round(a, 3) for a in scheduler.acceptance[1:]]} "
+                                f"after {self.steps_without_probe} steps without a probe")
+            self.steps_without_probe = 0 if q - 1 == K else self.steps_without_probe + 1
         if len(ids) != q * len(seqs):
             raise Violation(f"{len(ids)} decode inputs for {len(seqs)} seqs, expected {q} each")
         # Each sequence's tokens, including those of the step still in flight (async scheduling).
@@ -358,7 +371,7 @@ class FakeModel:
             token_ids = list(seq.token_ids)
             if seq.num_inflight:
                 inflight = self.last_outputs.get(seq.seq_id)
-                if inflight is None or seq.num_inflight not in (1, 1 + self.num_speculative_tokens):
+                if inflight is None or not 1 <= seq.num_inflight <= 1 + self.num_speculative_tokens:
                     raise Violation(f"seq {seq.seq_id}: {seq.num_inflight} tokens in flight but no step produced them")
                 token_ids += inflight if isinstance(inflight, list) else [inflight]
             all_token_ids.append(token_ids)
@@ -367,23 +380,36 @@ class FakeModel:
                 raise Violation("draft inputs prepared for a step without drafts")
             all_drafts = [[] for _ in seqs]
         elif self.draft_kv:
-            # The catch-up inputs: the last m tokens of every sequence (m >= 2), padded in front for a
-            # shorter sequence, each at its position and slot, with the slot masked for a cached or
-            # padding token. Whether every token the draft cache lacks is among them shows when the
-            # fake draft model reads its cache (FakeDraftModel.__call__).
+            # The catch-up inputs: the last m tokens of every sequence, where m is 2 or the most tokens
+            # a draft cache lacks, padded in front for a shorter sequence, each at its position and
+            # slot, with the slot masked exactly for the cached and padding tokens. What a draft cache
+            # lacks: the tokens after seq.num_draft_cached_tokens, or after an in-flight step with
+            # drafts (which caught up itself) only its newest token, and the last draft too when all
+            # of them were accepted. Whether every lacking token is written shows when the fake draft
+            # model reads its cache (FakeDraftModel.__call__); here the slots are checked against that.
             catchup_ids, catchup_pos, catchup_slots = meta["draft_inputs"]
             m = len(catchup_ids[0])
-            if m < 2 or any(len(row) != m for row in catchup_ids + catchup_pos + catchup_slots):
-                raise Violation(f"catch-up inputs for {m} tokens per sequence: {catchup_ids} {catchup_pos} {catchup_slots}")
+            cached = []
+            for i, seq in enumerate(seqs):
+                n = len(all_token_ids[i])
+                if seq.num_inflight > 1:
+                    cached.append(n - 1 - (len(self.last_outputs[seq.seq_id]) == seq.num_inflight))
+                else:
+                    cached.append(seq.num_draft_cached_tokens)
+            expected_m = max([2] + [len(all_token_ids[i]) - c for i, c in enumerate(cached)])
+            if m != expected_m or any(len(row) != m for row in catchup_ids + catchup_pos + catchup_slots):
+                raise Violation(f"catch-up inputs for {m} tokens per sequence, expected {expected_m}: {catchup_ids} {catchup_pos} {catchup_slots}")
             for i, seq in enumerate(seqs):
                 n = len(all_token_ids[i])
                 if catchup_pos[i] != [max(0, p) for p in range(n - m, n)]:
                     raise Violation(f"seq {seq.seq_id}: catch-up positions {catchup_pos[i]} for {n} tokens")
                 for j, s in enumerate(catchup_slots[i]):
                     p = n - m + j
+                    if (s == -1) != (p < cached[i]):
+                        raise Violation(f"seq {seq.seq_id}: catch-up slot {s} at position {p} with {cached[i]} tokens in the draft cache")
                     if s == -1:
                         continue
-                    if p < 0 or s != block_tables[i][p // bs] * bs + p % bs or catchup_ids[i][j] != all_token_ids[i][p]:
+                    if s != block_tables[i][p // bs] * bs + p % bs or catchup_ids[i][j] != all_token_ids[i][p]:
                         raise Violation(f"seq {seq.seq_id}: catch-up token {catchup_ids[i][j]} at position {p} with slot {s}")
             ids, all_drafts = self._propose(seqs, meta, all_token_ids, q - 1)
         else:
@@ -575,7 +601,7 @@ def random_requests(rng, block_size, capacity, pressure):
 
 
 def set_acceptance_switch(engine, rng):
-    """A short window and probe interval, so the switch flips many times within a case."""
+    """A short window and probe interval, so k changes many times within a case."""
     engine.scheduler.ACCEPTANCE_WINDOW = rng.randint(2, 40)
     engine.scheduler.PROBE_INTERVAL = rng.randint(1, 6)
     engine.model_runner.mixed_draft_quality = True
@@ -592,7 +618,7 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
     max_num_seqs = rng.randint(1, 8)
     max_num_batched_tokens = max(1, rng.choice([1, 2, bs - 1, bs, bs + 1, 2 * bs, 3 * bs + 1, rng.randint(1, 10 * bs), 10 ** 6]))
     # Adaptive: drafts only while at most 1-3 sequences run, so steps with and without drafts alternate.
-    # Acceptance: drafts switched off while too many are rejected (half the requests get good drafts).
+    # Acceptance: k follows the per-position acceptance rates (half the requests get good drafts).
     engine = make_engine(num_blocks, bs, max_num_seqs, max_num_batched_tokens, async_scheduling, num_speculative_tokens, draft_model,
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
                          speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None)

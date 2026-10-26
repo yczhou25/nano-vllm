@@ -18,7 +18,7 @@
 | N-gram speculative decoding | `nanovllm/engine/ngram.py`, `model_runner.py` | Prompt-lookup drafts: propose `k` tokens from earlier text, verify them in one forward pass. `LLM(..., num_speculative_tokens=k)` |
 | Draft-model speculative decoding | `nanovllm/engine/model_runner.py`, `block_manager.py` | A smaller model of the same family drafts; it keeps its own KV cache and block tables. `LLM(..., speculative_model=PATH)`; combines with `async_scheduling` |
 | Rejection sampling | `nanovllm/layers/sampler.py` | Accept/reject drafts so outputs follow the target model's distribution; greedy with `temperature=0` |
-| Adaptive speculation | `nanovllm/engine/scheduler.py`, `model_runner.py` | Two switches that turn drafts off per decode step: `LLM(..., speculative_disable_by_batch_size=n)` while more than `n` sequences are running, where the GPU is busy anyway, and `speculative_min_acceptance=r` while the acceptance rate over the last 256 drafts is below `r`, with one probe step every 16 steps to let drafts back in. Steps without drafts skip the draft model; its KV cache lags behind and the next step with drafts catches it up in one forward pass |
+| Adaptive speculation | `nanovllm/engine/scheduler.py`, `model_runner.py` | The scheduler picks each decode step's `k`: `LLM(..., speculative_disable_by_batch_size=n)` drops drafts while more than `n` sequences are running, where the GPU is busy anyway; `speculative_min_acceptance=r` tracks the acceptance rate of every draft position over its last 64 samples and proposes only the leading positions that reach `r` (down to none), with one full-`k` probe step every 16 steps to let positions back in. Steps without drafts skip the draft model; its KV cache lags behind and the next step with drafts catches it up in one forward pass |
 | Tensor-parallel fixes | `sequence.py`, `model_runner.py` | Decode slot mapping used the model's block size instead of the runner's; prefill sent unscheduled tokens to TP workers (both found by auditing the code) |
 | Test suite + CI | `tests/`, `.github/workflows/tests.yml` | Runs on CPU with stubs for flash-attn and triton; GPU tests compare greedy outputs with `transformers` |
 
@@ -43,13 +43,13 @@ outputs = llm.generate(["Hello, nano-vllm."], SamplingParams(temperature=0.6, ma
 print(outputs[0]["text"])
 ```
 
-Drop `speculative_model` to draft with n-grams instead (n-gram drafts do not combine with `async_scheduling`). Add `speculative_disable_by_batch_size=8` to speculate only for small batches, or `speculative_min_acceptance=0.2` to stop drafting while the drafts are being rejected (n-gram drafts on chat, for example). Without any of these options the engine behaves like upstream nano-vllm.
+Drop `speculative_model` to draft with n-grams instead (n-gram drafts do not combine with `async_scheduling`). Add `speculative_disable_by_batch_size=8` to speculate only for small batches, or `speculative_min_acceptance=0.2` to let the measured acceptance rate of each draft position pick `k` per step, from `num_speculative_tokens` down to none (n-gram drafts on chat, for example, get switched off). Without any of these options the engine behaves like upstream nano-vllm.
 
 ## Tests
 
 ```bash
 pip install pytest
-pytest                                                        # CPU: scheduler, block manager, input prep, sampler, n-gram, acceptance switch, simulator
+pytest                                                        # CPU: scheduler, block manager, input prep, sampler, n-gram, adaptive k, simulator
 NANOVLLM_TEST_MODEL=~/huggingface/Qwen3-0.6B/ pytest -m gpu   # GPU: greedy outputs vs. transformers with teacher forcing
 ```
 
@@ -95,7 +95,7 @@ What the numbers say:
 - N-gram drafts are the honest worst case: 2.8x on code editing, where the output copies the input (acceptance 0.5), but useless on chat (acceptance 0.05), where they slow decoding down at batch 8 and 32.
 - Async scheduling gave +10% on Qwen3-0.6B and nothing measurable on Qwen3-8B: the CPU work it hides is a fixed few milliseconds per step, large next to a 0.6B forward pass and small next to an 8B one.
 - Adaptive speculation behaves as designed below its threshold (same numbers as draft k=4) and now costs nothing above it: 0.98x on edit and 1.00x on chat at batch 32, where it switches drafts off (0.96x and 1.01x with async scheduling on top). Its first version measured 0.76x and 0.85x there, because the draft model still ran one step per decode step to keep its KV cache current, and that step reads the draft's whole KV cache, which for Qwen3-0.6B is 28 layers of the same per-layer size as the 8B's 36. The fix lets the draft cache lag while drafts are off and catches it up in one forward pass when they resume (the design note has the mutation table).
-- The threshold is the remaining lesson: on this A40 the 8B target is still memory-bound at batch 32, so leaving draft k=4 on (1.45x on edit, 1.10x on chat) beats switching it off at 8 sequences. The threshold belongs where the target turns compute-bound, and the better switch is measured acceptance: it would turn n-gram drafts off on chat (acceptance 0.05) and leave model drafts (0.40 to 0.85) on.
+- The threshold is the remaining lesson: on this A40 the 8B target is still memory-bound at batch 32, so leaving draft k=4 on (1.45x on edit, 1.10x on chat) beats switching it off at 8 sequences. The threshold belongs where the target turns compute-bound, and the better switch is measured acceptance: it would turn n-gram drafts off on chat (acceptance 0.05) and leave model drafts (0.40 to 0.85) on. `speculative_min_acceptance` is that switch, extended to pick `k` per step from each draft position's acceptance rate (position `j` is only accepted when the `j-1` before it were, so the rates fall with the position and the cut lands where they drop below the threshold); its A40 numbers are the next run.
 
 ## Credits
 
