@@ -18,6 +18,7 @@ def make_scheduler(num_seqs, min_acceptance=0.5, disable_by=None, window=16, pro
                                       num_speculative_tokens=K, draft_model=True, speculative_disable_by_batch_size=disable_by,
                                       speculative_min_acceptance=min_acceptance))
     scheduler.ACCEPTANCE_WINDOW, scheduler.PROBE_INTERVAL = window, probe
+    scheduler.ACCEPTANCE_MIN_STEPS = 1    # the tests below reason in samples; see test_the_window_covers_at_least_min_steps
     for _ in range(num_seqs):
         scheduler.add(Sequence([1, 2, 3], SamplingParams(max_tokens=10 ** 6, ignore_eos=True)))
     seqs, is_prefill = scheduler.schedule()
@@ -122,6 +123,29 @@ def test_the_window_forgets_old_history():
     assert ks == [K, 0, K, K]
     assert rates(scheduler) == [0.704] * K
     assert [decode(scheduler, [4, 4]) for _ in range(3)] == [K, K, K]
+
+
+def test_the_window_covers_at_least_min_steps():
+    scheduler = make_scheduler(4, window=4, probe=1)    # 4 samples per position per step
+    scheduler.ACCEPTANCE_MIN_STEPS = 2                  # so the window is 8 samples, not 4
+    assert decode(scheduler, [0] * 4) == K              # 0/4
+    assert decode(scheduler, [4] * 4) == 0
+    assert decode(scheduler, [4] * 4) == K              # probe: (0*4 + 4) / 8 = 0.5
+    assert rates(scheduler) == [0.5] * K and scheduler.num_acceptance_samples == [0, 8, 8, 8, 8]
+    assert decode(scheduler, [4] * 4) == K              # (0.5*8 + 4) / 12 = 0.667; with a 4-sample window it would be 0.75
+    assert rates(scheduler) == [0.667] * K and scheduler.num_acceptance_samples == [0, 8, 8, 8, 8]
+
+
+def test_statistics_count_steps_and_positions():
+    scheduler = make_scheduler(2, probe=100)
+    assert decode(scheduler, [4, 1]) == K     # positions: 2/2, 1/2, 1/2, 1/2
+    assert decode(scheduler, [0, 0]) == K     # every position 0.5: not below
+    assert decode(scheduler, [1, 1]) == 1     # position 1 at 0.5, position 2 at 0.25
+    assert scheduler.num_steps_by_k == [0, 1, 0, 0, 2]
+    assert scheduler.num_proposed_by_position == [0, 6, 4, 4, 4] and scheduler.num_accepted_by_position == [0, 4, 1, 1, 1]
+    assert (scheduler.num_draft_tokens, scheduler.num_accepted_tokens) == (18, 7)
+    scheduler.reset_stats()
+    assert scheduler.num_steps_by_k == [0] * 5 and scheduler.num_draft_tokens == 0 and rates(scheduler) != [1.0] * K    # the window is kept
 
 
 def test_partial_acceptance_counts_each_position_across_the_batch():

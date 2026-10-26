@@ -60,6 +60,7 @@ class ModelRunner:
             self.sampler = Sampler()
             self.rejection_sampler = RejectionSampler()
             self.warmup_model()
+            self.warmup_samplers()
             self.allocate_kv_cache()
             if not self.enforce_eager:
                 self.capture_cudagraph()
@@ -132,6 +133,30 @@ class ModelRunner:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
         torch.cuda.empty_cache()
+
+    def decode_query_lengths(self) -> list[int]:
+        """Tokens per sequence a decode step can have: 1 + the drafts, 1 for a step without drafts
+        (a large batch, see Scheduler.schedule), and with adaptive k anything in between."""
+        config = self.config
+        q = 1 + self.num_speculative_tokens
+        qs = {q}
+        if config.speculative_disable_by_batch_size is not None:
+            qs.add(1)
+        if config.speculative_min_acceptance is not None:
+            qs.update(range(1, q))
+        return sorted(qs)
+
+    def warmup_samplers(self):
+        """Compile the samplers now rather than in the first decode steps. They are compiled for
+        symbolic shapes, so a few rows per query length cover every batch size."""
+        vocab_size = self.config.hf_config.vocab_size
+        temperatures = torch.ones(8, dtype=torch.float32)
+        for q in self.decode_query_lengths():
+            logits = torch.zeros(8 * q, vocab_size)
+            if q == 1:
+                self.sampler(logits, temperatures)
+            else:
+                self.rejection_sampler(logits, temperatures, torch.zeros(8, q - 1, dtype=torch.int64))
 
     def kv_cache_block_bytes(self, hf_config) -> int:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -451,13 +476,8 @@ class ModelRunner:
         )
         # Decode steps without drafts (a large batch) or with fewer of them (adaptive k, see
         # Scheduler.schedule) need their own graphs.
-        qs = {q}
-        if config.speculative_disable_by_batch_size is not None:
-            qs.add(1)
-        if config.speculative_min_acceptance is not None:
-            qs.update(range(1, q))
         self.graphs = {}
-        for q in sorted(qs):
+        for q in self.decode_query_lengths():
             self.graphs[q] = self.capture_graphs(self.model, self.graph_vars["outputs"], q)
         self.draft_graphs = {}
         if self.draft_model is not None:

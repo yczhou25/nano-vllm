@@ -603,6 +603,7 @@ def random_requests(rng, block_size, capacity, pressure):
 def set_acceptance_switch(engine, rng):
     """A short window and probe interval, so k changes many times within a case."""
     engine.scheduler.ACCEPTANCE_WINDOW = rng.randint(2, 40)
+    engine.scheduler.ACCEPTANCE_MIN_STEPS = rng.randint(1, 4)
     engine.scheduler.PROBE_INTERVAL = rng.randint(1, 6)
     engine.model_runner.mixed_draft_quality = True
 

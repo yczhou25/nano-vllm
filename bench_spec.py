@@ -64,7 +64,7 @@ def main():
     llm.generate(prompts[:1], SamplingParams(max_tokens=16), use_tqdm=False)    # warmup
 
     scheduler = llm.scheduler
-    scheduler.num_draft_tokens = scheduler.num_accepted_tokens = 0
+    scheduler.reset_stats()
     num_tokens = 0
     t = time.perf_counter()
     for i in range(0, len(prompts), args.batch_size):
@@ -73,8 +73,12 @@ def main():
     t = time.perf_counter() - t
     acceptance = scheduler.num_accepted_tokens / scheduler.num_draft_tokens if scheduler.num_draft_tokens else 0.0
     drafter = "none" if not args.num_speculative_tokens else "model" if args.speculative_model else "ngram"
+    # Per draft position: accepted / proposed (position j is only accepted when the j-1 before it were).
+    # k_steps: decode steps by their number of drafts (adaptive speculation picks it per step).
+    acc_pos = ",".join(f"{a / p:.2f}" if p else "-" for p, a in zip(scheduler.num_proposed_by_position[1:], scheduler.num_accepted_by_position[1:]))
+    k_steps = ",".join(map(str, scheduler.num_steps_by_k))
     print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} batch={args.batch_size} T={args.temperature} "
-          f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f}")
+          f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f} acc_pos={acc_pos} k_steps={k_steps}")
 
 
 if __name__ == "__main__":

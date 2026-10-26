@@ -4,7 +4,9 @@ from torch import nn
 
 class Sampler(nn.Module):
 
-    @torch.compile
+    # Compiled once for symbolic shapes: the batch size changes with every tail batch, and with adaptive
+    # speculation the number of tokens per sequence too; a recompile per shape costs seconds each.
+    @torch.compile(dynamic=True)
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         greedy_tokens = logits.argmax(dim=-1)
         logits = logits.float().div_(temperatures.clamp_min(1e-10).unsqueeze(dim=1))
@@ -21,7 +23,7 @@ class RejectionSampler(nn.Module):
     the distribution that sampling one token at a time would give. Greedy rows (temperature 0)
     keep drafts that match the argmax."""
 
-    @torch.compile
+    @torch.compile(dynamic=True)
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, draft_token_ids: torch.Tensor):
         """logits: (batch_size * (k + 1), vocab_size); draft_token_ids: (batch_size, k).
         Returns (batch_size, k + 1) token ids: the accepted drafts, one sampled token, then -1."""

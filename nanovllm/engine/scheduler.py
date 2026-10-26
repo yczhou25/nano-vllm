@@ -13,7 +13,8 @@ class Scheduler:
     # threshold (none: it runs without drafts), except one probe step with all K positions every
     # PROBE_INTERVAL steps, which is how later positions, and drafts at all, come back once the
     # workload changes.
-    ACCEPTANCE_WINDOW = 64    # sequence-steps per position
+    ACCEPTANCE_WINDOW = 64    # sequence-steps per position, or ACCEPTANCE_MIN_STEPS steps if that is more
+    ACCEPTANCE_MIN_STEPS = 8  # a large batch fills 64 samples in two steps, too few to decide on
     PROBE_INTERVAL = 16       # decode steps
 
     def __init__(self, config: Config):
@@ -32,7 +33,7 @@ class Scheduler:
         self.num_acceptance_samples = [0] * (self.num_speculative_tokens + 1)
         self.num_steps_without_probe = 0    # consecutive decode steps that proposed fewer than K drafts
         self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens and not self.has_draft_model else None
-        self.num_draft_tokens = self.num_accepted_tokens = 0    # speculative decoding statistics
+        self.reset_stats()
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -105,7 +106,17 @@ class Scheduler:
         self.running.extendleft(reversed(kept_seqs))
         if scheduled_seqs:
             self.num_steps_without_probe = 0 if k == self.num_speculative_tokens else self.num_steps_without_probe + 1
+            self.num_steps_by_k[k] += 1
         return scheduled_seqs, False
+
+    def reset_stats(self):
+        """Speculative decoding statistics (cumulative, unlike the acceptance window): drafts proposed
+        and accepted in all, per draft position, and decode steps by their number of drafts."""
+        k = self.num_speculative_tokens
+        self.num_draft_tokens = self.num_accepted_tokens = 0
+        self.num_proposed_by_position = [0] * (k + 1)
+        self.num_accepted_by_position = [0] * (k + 1)
+        self.num_steps_by_k = [0] * (k + 1)
 
     def num_acceptable_drafts(self) -> int:
         """The leading draft positions whose measured acceptance rate reaches the threshold."""
@@ -200,9 +211,12 @@ class Scheduler:
         self.num_accepted_tokens += sum(accepted)
         for j in range(1, self.num_speculative_tokens + 1):
             if proposed[j]:
-                # A running mean over about the last ACCEPTANCE_WINDOW samples: a plain mean until that
-                # many were seen, then each step's samples replace that share of the window.
-                seen = min(self.num_acceptance_samples[j], self.ACCEPTANCE_WINDOW)
+                self.num_proposed_by_position[j] += proposed[j]
+                self.num_accepted_by_position[j] += accepted[j]
+                # A running mean over about the last `window` samples: a plain mean until that many
+                # were seen, then each step's samples replace that share of the window.
+                window = max(self.ACCEPTANCE_WINDOW, self.ACCEPTANCE_MIN_STEPS * proposed[j])
+                seen = min(self.num_acceptance_samples[j], window)
                 self.acceptance[j] = (self.acceptance[j] * seen + accepted[j]) / (seen + proposed[j])
-                self.num_acceptance_samples[j] = min(seen + proposed[j], self.ACCEPTANCE_WINDOW)
+                self.num_acceptance_samples[j] = min(seen + proposed[j], window)
         return finished
