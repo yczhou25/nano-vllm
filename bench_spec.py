@@ -55,6 +55,7 @@ def main():
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument("--speculative-disable-by-batch-size", type=int, default=None, help="decode without drafts while more sequences than this are running")
     parser.add_argument("--speculative-min-acceptance", type=float, default=None, help="propose only the leading draft positions whose measured acceptance rate reaches this (down to none)")
+    parser.add_argument("--probe-interval", type=int, default=None, help="with --speculative-min-acceptance: decode steps between two full-K probes (default Scheduler.PROBE_INTERVAL)")
     args = parser.parse_args()
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,
@@ -64,6 +65,8 @@ def main():
     llm.generate(prompts[:1], SamplingParams(max_tokens=16), use_tqdm=False)    # warmup
 
     scheduler = llm.scheduler
+    if args.probe_interval is not None:
+        scheduler.PROBE_INTERVAL = args.probe_interval
     scheduler.reset_stats()
     num_tokens = 0
     t = time.perf_counter()
@@ -77,7 +80,7 @@ def main():
     # k_steps: decode steps by their number of drafts (adaptive speculation picks it per step).
     acc_pos = ",".join(f"{a / p:.2f}" if p else "-" for p, a in zip(scheduler.num_proposed_by_position[1:], scheduler.num_accepted_by_position[1:]))
     k_steps = ",".join(map(str, scheduler.num_steps_by_k))
-    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} batch={args.batch_size} T={args.temperature} "
+    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} probe={scheduler.PROBE_INTERVAL} batch={args.batch_size} T={args.temperature} "
           f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f} acc_pos={acc_pos} k_steps={k_steps}")
 
 
