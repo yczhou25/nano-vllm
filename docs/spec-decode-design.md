@@ -379,7 +379,9 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 - **开关的损失基本不随探测次数变**：探测减到 1/4，损失只从 5.9% 变到 5.2%。按 k=4 固定那行算，一步 k=4 是 48.3 ms、普通步 34.6 ms，60 次探测只多 0.8 s，而开关那行总共多了 2.4 s；探测 64 那行多 2.0 s，探测只解释 0.2 s。两行都剩约 1.5–1.8 s 的固定开销，和出了多少草稿无关。
 - **固定开销是 `torch.compile` 的 0/1 特化**：dynamic=True 把每个维度当符号，唯独大小 0 和 1 会特化成常数。启动时的预热只用 batch 8 编译，bench 自己的预热（1 个 prompt、16 个 token）又把 batch 1 的 q=1 和 q=K+1 编了，但 batch 1、q=2（一条序列、一个草稿）谁都没编——每个 batch 的尾巴都会收缩到一条序列，碰上一步 k=1 就在计时区间里重编译一次（GPU 上约 1.5 s）。CPU 上开着 dynamo 的重编译日志复现了这条序列：全程 6 张图，其中 1 张在尾巴那步才编。第一版修法是 `warmup_samplers` 把 batch 1 也预热一遍（c4cf5ac），CPU 上同一条序列计时区间里零编译。
 - **GPU 上复测（作业 231468，开着 `TORCH_LOGS=recompiles`）却没好**：开关行 961.9 对基线 1038.6（×0.93）。日志里 186 条 Recompiling 说明了原因：每一行（包括基线）在第一个真实请求时把所有编译过的层（两个 layernorm、rotary、activation）和两个采样器**全部重编译一遍**，守卫是 `utils_device.CURRENT_DEVICE == device('cuda')`——`ModelRunner` 加载模型和预热时把 torch 的默认设备设成 cuda，服务时又改回 cpu，而 `torch.compile` 会对默认设备加守卫。所以启动时的预热全部作废；bench 自己的预热调用把这一串重编译挡在了计时器外面，但那一次是 batch 1 的 prompt，于是采样器被 0/1 特化成 batch 1，计时区间里再重编译两次（`temperatures` 从 1 到 32；`2 <= draft_token_ids.size()[1]`，k 从 ≥2 到 1）。对真实用户来说这是第一个请求的延迟：十几次编译、几十秒。
-- **第二版修法**：预热和 CUDA graph 捕获都挪到默认设备恢复成 cpu 之后，预热用的张量显式写 `device="cuda"` 和模型的 dtype。复测作业 `cluster/nanovllm-adaptive-k5-a40.sbatch`（同样的 8 行、开着重编译日志）看计时区间里是否零编译。
+- **第二版修法**：预热和 CUDA graph 捕获都挪到默认设备恢复成 cpu 之后，预热用的张量显式写 `device="cuda"` 和模型的 dtype（ac3f3be）。
+- **复测（作业 231709，`docs/benchmarks/qwen3-8b-a40-adaptive-k5.txt`）**：默认设备那条守卫没了（日志从 186 条降到 134 条，层不再重编译），但开关行还是 ×0.94（829.7 对基线 880.2 / 880.8，关草稿 881.0）。剩下的守卫是 `requires_grad mismatch`：`ModelRunner.run` / `run_async` 没有放在 `torch.inference_mode` 下（只有模型的 forward 在），所以真实步的 lm_head logits 带着 autograd、预热的不带，两个采样器在第一个真实步又编了一遍；之后照旧被 bench 的 batch 1 预热 0/1 特化，再加一条 stride 守卫（真实草稿是 `input_ids.view(B, q)[:, 1:]`，stride 是 (q, 1)，预热用的是连续张量），拒绝采样器在计时区间里又编了两次。草稿模型那两行照样是 ×1.08（固定 k=4，953.4）和 ×1.20（K=4 + 开关，1052.4）。
+- **第三版修法**：`run` / `run_async` 加 `@torch.inference_mode()`，采样器预热也在 inference mode 下跑，草稿用 `(batch, q)` 张量的列切片。CPU 上开着重编译日志：预热编 6 张图，之后 bench 式的服务序列零编译。复测作业 `cluster/nanovllm-adaptive-k6-a40.sbatch`（同样的 8 行）。
 
 ## 还没做的
 

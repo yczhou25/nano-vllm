@@ -154,16 +154,19 @@ class ModelRunner:
         symbolic shapes, so a few rows per query length cover every batch size, with one exception:
         torch.compile specializes sizes 0 and 1, so a batch of one sequence (the tail of every
         batch) and a step with one draft are shapes of their own, compiled here as well. The inputs
-        have the dtypes and device of the real ones, which the compiled code guards on too."""
+        are like the real ones in everything else the compiled code guards on: dtype, device,
+        strides (the drafts are a column slice of the step's input ids) and grad mode."""
         hf_config = self.config.hf_config
-        for batch_size in (8, 1):
-            temperatures = torch.ones(batch_size, dtype=torch.float32, device="cuda")
-            for q in self.decode_query_lengths():
-                logits = torch.zeros(batch_size * q, hf_config.vocab_size, dtype=hf_config.dtype, device="cuda")
-                if q == 1:
-                    self.sampler(logits, temperatures)
-                else:
-                    self.rejection_sampler(logits, temperatures, torch.zeros(batch_size, q - 1, dtype=torch.int64, device="cuda"))
+        with torch.inference_mode():
+            for batch_size in (8, 1):
+                temperatures = torch.ones(batch_size, dtype=torch.float32, device="cuda")
+                for q in self.decode_query_lengths():
+                    logits = torch.zeros(batch_size * q, hf_config.vocab_size, dtype=hf_config.dtype, device="cuda")
+                    if q == 1:
+                        self.sampler(logits, temperatures)
+                    else:
+                        input_ids = torch.zeros(batch_size, q, dtype=torch.int64, device="cuda")
+                        self.rejection_sampler(logits, temperatures, input_ids[:, 1:])
 
     def kv_cache_block_bytes(self, hf_config) -> int:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -400,6 +403,7 @@ class ModelRunner:
         restore_context(context)
         return input_ids.view(-1)
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
         k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -418,6 +422,7 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    @torch.inference_mode()
     def run_async(self, seqs: list[Sequence], is_prefill: bool) -> "AsyncOutput | None":
         """Like run, but returns before the GPU finishes. The sampled tokens stay on the GPU as
         inputs for the next decode step, and are copied to the host in the background."""
