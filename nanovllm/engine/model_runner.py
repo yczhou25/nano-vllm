@@ -59,13 +59,16 @@ class ModelRunner:
                 load_model(self.draft_model, config.speculative_model)
             self.sampler = Sampler()
             self.rejection_sampler = RejectionSampler()
+            torch.set_default_device("cpu")
+            torch.set_default_dtype(default_dtype)
+            # The warmup and the graph capture run under the same default device and dtype as the
+            # engine does later: torch.compile guards on the default device, so a layer compiled
+            # while it was "cuda" is compiled again at the first real request.
             self.warmup_model()
             self.warmup_samplers()
             self.allocate_kv_cache()
             if not self.enforce_eager:
                 self.capture_cudagraph()
-            torch.set_default_device("cpu")
-            torch.set_default_dtype(default_dtype)
         except Exception:
             dist.destroy_process_group()    # or the next engine in this process could not start
             raise
@@ -150,16 +153,17 @@ class ModelRunner:
         """Compile the samplers now rather than in the first decode steps. They are compiled for
         symbolic shapes, so a few rows per query length cover every batch size, with one exception:
         torch.compile specializes sizes 0 and 1, so a batch of one sequence (the tail of every
-        batch) and a step with one draft are shapes of their own, compiled here as well."""
-        vocab_size = self.config.hf_config.vocab_size
-        for batch_size in (1, 8):
-            temperatures = torch.ones(batch_size, dtype=torch.float32)
+        batch) and a step with one draft are shapes of their own, compiled here as well. The inputs
+        have the dtypes and device of the real ones, which the compiled code guards on too."""
+        hf_config = self.config.hf_config
+        for batch_size in (8, 1):
+            temperatures = torch.ones(batch_size, dtype=torch.float32, device="cuda")
             for q in self.decode_query_lengths():
-                logits = torch.zeros(batch_size * q, vocab_size)
+                logits = torch.zeros(batch_size * q, hf_config.vocab_size, dtype=hf_config.dtype, device="cuda")
                 if q == 1:
                     self.sampler(logits, temperatures)
                 else:
-                    self.rejection_sampler(logits, temperatures, torch.zeros(batch_size, q - 1, dtype=torch.int64))
+                    self.rejection_sampler(logits, temperatures, torch.zeros(batch_size, q - 1, dtype=torch.int64, device="cuda"))
 
     def kv_cache_block_bytes(self, hf_config) -> int:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -169,7 +173,7 @@ class ModelRunner:
     def bind_kv_cache(self, model: Qwen3ForCausalLM, hf_config, num_blocks: int) -> torch.Tensor:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_blocks, self.block_size, num_kv_heads, head_dim)
+        kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cuda")
         layer_id = 0
         for module in model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -470,12 +474,12 @@ class ModelRunner:
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_pool = None
         self.graph_vars = dict(
-            input_ids=torch.zeros(max_bs * q, dtype=torch.int64),
-            positions=torch.zeros(max_bs * q, dtype=torch.int64),
-            slot_mapping=torch.zeros(max_bs * q, dtype=torch.int32),
-            context_lens=torch.zeros(max_bs, dtype=torch.int32),
-            block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32),
-            outputs=torch.zeros(max_bs * q, hf_config.hidden_size),
+            input_ids=torch.zeros(max_bs * q, dtype=torch.int64, device="cuda"),
+            positions=torch.zeros(max_bs * q, dtype=torch.int64, device="cuda"),
+            slot_mapping=torch.zeros(max_bs * q, dtype=torch.int32, device="cuda"),
+            context_lens=torch.zeros(max_bs, dtype=torch.int32, device="cuda"),
+            block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device="cuda"),
+            outputs=torch.zeros(max_bs * q, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda"),
         )
         # Decode steps without drafts (a large batch) or with fewer of them (adaptive k, see
         # Scheduler.schedule) need their own graphs.
@@ -485,6 +489,6 @@ class ModelRunner:
         self.draft_graphs = {}
         if self.draft_model is not None:
             # The first draft step scores two tokens per sequence, the others one (see propose).
-            self.graph_vars["draft_outputs"] = torch.zeros(max_bs * 2, config.draft_hf_config.hidden_size)
+            self.graph_vars["draft_outputs"] = torch.zeros(max_bs * 2, config.draft_hf_config.hidden_size, dtype=config.draft_hf_config.dtype, device="cuda")
             for q in (2, 1):
                 self.draft_graphs[q] = self.capture_graphs(self.draft_model, self.graph_vars["draft_outputs"], q)
