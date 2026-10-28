@@ -1,0 +1,11 @@
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=32 T=0.0 tokens=31064 time=35.34s throughput=878.9tok/s acceptance=0.000 acc_pos= k_steps=1022
+workload=chat drafter=ngram k=4 async=0 disable_by=1 min_acc=None probe=16 batch=32 T=0.0 tokens=31064 time=35.36s throughput=878.4tok/s acceptance=0.000 acc_pos=-,-,-,- k_steps=1022,0,0,0,0
+workload=chat drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=16 batch=32 T=0.0 tokens=31212 time=37.72s throughput=827.4tok/s acceptance=0.098 acc_pos=0.18,0.10,0.06,0.03 k_steps=928,23,0,0,60
+workload=chat drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=64 batch=32 T=0.0 tokens=31076 time=37.29s throughput=833.3tok/s acceptance=0.101 acc_pos=0.18,0.08,0.05,0.03 k_steps=994,12,0,0,15
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=32 T=0.0 tokens=31064 time=35.44s throughput=876.4tok/s acceptance=0.000 acc_pos= k_steps=1022
+workload=chat drafter=ngram k=4 async=0 disable_by=None min_acc=None probe=16 batch=32 T=0.0 tokens=31320 time=46.13s throughput=679.0tok/s acceptance=0.052 acc_pos=0.11,0.05,0.03,0.02 k_steps=0,0,0,0,956
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=32 T=0.0 tokens=31064 time=35.33s throughput=879.2tok/s acceptance=0.000 acc_pos= k_steps=1022
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=8 T=0.0 tokens=7840 time=31.34s throughput=250.2tok/s acceptance=0.000 acc_pos= k_steps=1022
+workload=chat drafter=ngram k=4 async=0 disable_by=1 min_acc=None probe=16 batch=8 T=0.0 tokens=7840 time=31.35s throughput=250.1tok/s acceptance=0.000 acc_pos=-,-,-,- k_steps=1022,0,0,0,0
+workload=chat drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=16 batch=8 T=0.0 tokens=7770 time=32.96s throughput=235.8tok/s acceptance=0.102 acc_pos=0.19,0.09,0.07,0.04 k_steps=936,15,0,0,60
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=8 T=0.0 tokens=7840 time=31.34s throughput=250.2tok/s acceptance=0.000 acc_pos= k_steps=1022

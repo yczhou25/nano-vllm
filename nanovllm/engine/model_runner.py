@@ -148,15 +148,18 @@ class ModelRunner:
 
     def warmup_samplers(self):
         """Compile the samplers now rather than in the first decode steps. They are compiled for
-        symbolic shapes, so a few rows per query length cover every batch size."""
+        symbolic shapes, so a few rows per query length cover every batch size, with one exception:
+        torch.compile specializes sizes 0 and 1, so a batch of one sequence (the tail of every
+        batch) and a step with one draft are shapes of their own, compiled here as well."""
         vocab_size = self.config.hf_config.vocab_size
-        temperatures = torch.ones(8, dtype=torch.float32)
-        for q in self.decode_query_lengths():
-            logits = torch.zeros(8 * q, vocab_size)
-            if q == 1:
-                self.sampler(logits, temperatures)
-            else:
-                self.rejection_sampler(logits, temperatures, torch.zeros(8, q - 1, dtype=torch.int64))
+        for batch_size in (1, 8):
+            temperatures = torch.ones(batch_size, dtype=torch.float32)
+            for q in self.decode_query_lengths():
+                logits = torch.zeros(batch_size * q, vocab_size)
+                if q == 1:
+                    self.sampler(logits, temperatures)
+                else:
+                    self.rejection_sampler(logits, temperatures, torch.zeros(batch_size, q - 1, dtype=torch.int64))
 
     def kv_cache_block_bytes(self, hf_config) -> int:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
