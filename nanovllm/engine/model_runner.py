@@ -42,6 +42,8 @@ class ModelRunner:
         self.last_token_ids = None    # last run_async step's sampled tokens, still on the GPU (see AsyncOutput)
         self.draft_model = None
         self.draft_inputs = None      # the draft model's decode inputs, prepared with the target's
+        self.draft_layout = None      # where each sequence's drafts go in the decode inputs (see ragged_layout)
+        self.sampler_layout = None    # the same for RejectionSampler, in a ragged batch only
         self.graphs = None            # CUDA graphs by decode batch size, once captured (see capture_cudagraph)
         self.draft_graphs = None
         self.graph_pool = None
@@ -167,6 +169,19 @@ class ModelRunner:
                     else:
                         input_ids = torch.zeros(batch_size, q, dtype=torch.int64, device="cuda")
                         self.rejection_sampler(logits, temperatures, input_ids[:, 1:])
+            if self.config.speculative_per_sequence:
+                # Ragged batches (at least two sequences, every number of drafts up to K) take the
+                # sampler's other branch, with the drafts gathered by the batch's layout.
+                batch_size = 8
+                temperatures = torch.ones(batch_size, dtype=torch.float32, device="cuda")
+                for k in range(1, self.num_speculative_tokens + 1):
+                    num_drafts = [k] + [j % (k + 1) for j in range(batch_size - 1)]
+                    token_index, _, num_drafts = self.ragged_layout(num_drafts)
+                    n = sum(seq_drafts + 1 for seq_drafts in num_drafts.tolist())
+                    logits = torch.zeros(n, hf_config.vocab_size, dtype=hf_config.dtype, device="cuda")
+                    input_ids = torch.zeros(n + 1, dtype=torch.int64, device="cuda")
+                    token_index, num_drafts = token_index.cuda(), num_drafts.cuda()
+                    self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts)
 
     def kv_cache_block_bytes(self, hf_config) -> int:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -250,7 +265,26 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
+    @staticmethod
+    def ragged_layout(num_drafts: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Where each sequence's rows are in a decode step's inputs, which hold every sequence's
+        input token and then its drafts, one row each: sequence i has 1 + num_drafts[i] rows. Returns
+        token_index (batch_size, 1 + max drafts), the row of each sequence's input token and drafts,
+        padded by repeating its last row; write_index (batch_size, max drafts), the rows its drafts
+        are written to, with the scratch row after the last one for the drafts it does not have;
+        and num_drafts (batch_size,). A batch whose sequences all have the same number of drafts
+        is a (batch_size, 1 + k) grid, and the samplers take it as such."""
+        k = max(num_drafts)
+        n = sum(num_drafts) + len(num_drafts)
+        token_index, write_index, row = [], [], 0
+        for num in num_drafts:
+            token_index.append([row + min(j, num) for j in range(k + 1)])
+            write_index.append([row + j if j <= num else n for j in range(1, k + 1)])
+            row += 1 + num
+        return torch.tensor(token_index, dtype=torch.int64), torch.tensor(write_index, dtype=torch.int64), torch.tensor(num_drafts, dtype=torch.int64)
+
     def prepare_decode(self, seqs: list[Sequence]):
+        self.draft_layout = self.sampler_layout = None
         if self.draft_model is not None:
             return self.prepare_decode_with_draft_model(seqs)
         input_ids = []
@@ -258,6 +292,7 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        cu_seqlens_q = [0]
         for seq in seqs:
             # With async scheduling the newest token may still be on the GPU, in the last step's output.
             # With speculative decoding the draft tokens follow it, and all of them are scored at once.
@@ -269,6 +304,7 @@ class ModelRunner:
                 positions.append(position)
                 slot_mapping.append(seq.block_table[position // self.block_size] * self.block_size + position % self.block_size)
             context_lens.append(positions[-1] + 1)
+            cu_seqlens_q.append(len(input_ids))
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         if any(row >= 0 for row in inflight_rows):
             inflight_rows = torch.tensor(inflight_rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -277,15 +313,35 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        num_drafts = [len(seq.draft_token_ids) for seq in seqs]
+        if len(set(num_drafts)) > 1:
+            self.set_ragged_context(seqs, num_drafts, cu_seqlens_q, slot_mapping, context_lens, block_tables)
+        else:
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
+
+    def set_ragged_context(self, seqs: list[Sequence], num_drafts: list[int], cu_seqlens_q: list[int], slot_mapping: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor):
+        """The context of a ragged decode batch (speculative_per_sequence): its sequences have
+        different numbers of drafts, so the attention runs the varlen kernel over the block tables
+        instead of the fixed-width decode kernel and the CUDA graphs, and RejectionSampler gets the
+        batch's layout. The key lengths are cumulated on the GPU, where with async scheduling the
+        in-flight tokens are only known; their maximum is bounded from the CPU side."""
+        token_index, _, num_drafts = self.ragged_layout(num_drafts)
+        self.sampler_layout = token_index.cuda(non_blocking=True), num_drafts.cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.zeros(len(seqs) + 1, dtype=torch.int32, device=context_lens.device)
+        cu_seqlens_k[1:] = context_lens.cumsum(0)
+        max_seqlen_q = 1 + max(seq.num_scheduled_tokens - 1 for seq in seqs)
+        max_seqlen_k = max(len(seq) + seq.num_inflight + seq.num_scheduled_tokens - 1 for seq in seqs)
+        set_context(False, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
 
     def prepare_decode_with_draft_model(self, seqs: list[Sequence]):
         """Decode inputs for speculative decoding with a draft model, computed on the GPU: with
         async scheduling the number of tokens the in-flight step added, and so every position, is
         only known there. In a step with drafts also prepares the draft model's catch-up inputs
         (see propose): the tokens its KV cache lacks, many after steps without drafts."""
-        k = seqs[0].num_scheduled_tokens - 1    # drafts in this step: up to num_speculative_tokens, 0 for a large batch
+        num_drafts = [seq.num_scheduled_tokens - 1 for seq in seqs]    # per sequence: up to num_speculative_tokens, 0 for a large batch
+        k = max(num_drafts)    # drafts in this step; with speculative_per_sequence some sequences have fewer (a ragged batch)
         block_size = self.block_size
 
         def to_cuda(values, dtype):
@@ -305,8 +361,12 @@ class ModelRunner:
             newest = output.gather(1, (num_inflight - 1).clamp_min(0).unsqueeze(1)).squeeze(1)
             last_token = torch.where(num_inflight >= 1, newest, last_token)
         # The target scores the newest token and k drafts (propose fills them in) at positions
-        # num_tokens - 1 .. num_tokens + k - 1.
-        positions = (num_tokens - 1).unsqueeze(1) + torch.arange(k + 1, device=num_tokens.device)
+        # num_tokens - 1 .. num_tokens + k - 1: a row per sequence here, of which a sequence with
+        # fewer drafts uses the first 1 + num_drafts (the others repeat its last position, as it
+        # has no blocks past it, and are dropped below).
+        token_index, write_index, num_drafts_tensor = self.ragged_layout(num_drafts)
+        num_drafts_tensor = num_drafts_tensor.cuda(non_blocking=True)
+        positions = (num_tokens - 1).unsqueeze(1) + torch.minimum(torch.arange(k + 1, device=num_tokens.device), num_drafts_tensor.unsqueeze(1))
         slot_mapping = (block_tables.gather(1, positions // block_size) * block_size + positions % block_size).to(torch.int32)
         input_ids = torch.cat([last_token.unsqueeze(1), torch.zeros_like(positions[:, 1:])], dim=1)
         self.draft_inputs = None
@@ -317,8 +377,10 @@ class ModelRunner:
             # sequence, m being the most any of them lacks (at least 2, which a CUDA graph covers);
             # tokens it has cached get a masked slot, and a sequence shorter than m is padded in
             # front. With async scheduling the in-flight step's tokens are appended on the GPU.
+            # A sequence without drafts in this step is left out (every slot masked): its cache
+            # falls behind as in a step without drafts, and the scheduler counts it so.
             cached = [seq.num_draft_cached_tokens for seq in seqs]
-            m = max([2] + [2 if seq.num_inflight > 1 else len(seq) + seq.num_inflight - c for seq, c in zip(seqs, cached)])
+            m = max([2] + [2 if seq.num_inflight > 1 else len(seq) + seq.num_inflight - c for seq, c, num in zip(seqs, cached, num_drafts) if num])
             tail = to_cuda([([0] * m + seq.token_ids[c:])[-m:] for seq, c in zip(seqs, cached)], torch.int64)
             cached = to_cuda(cached, torch.int64)
             if output is not None:
@@ -332,10 +394,27 @@ class ModelRunner:
             catchup_positions = (num_tokens - m).unsqueeze(1) + torch.arange(m, device=num_tokens.device)
             padded_positions = catchup_positions.clamp_min(0)
             catchup_slots = block_tables.gather(1, padded_positions // block_size) * block_size + padded_positions % block_size
-            catchup_slots = torch.where(catchup_positions >= cached.unsqueeze(1), catchup_slots, -1).to(torch.int32)
+            drafted = to_cuda([num > 0 for num in num_drafts], torch.bool)
+            catchup_slots = torch.where((catchup_positions >= cached.unsqueeze(1)) & drafted.unsqueeze(1), catchup_slots, -1).to(torch.int32)
             self.draft_inputs = tail, padded_positions, catchup_slots
-        set_context(False, slot_mapping=slot_mapping.view(-1), context_lens=(num_tokens + k).to(torch.int32), block_tables=block_tables)
-        return input_ids.view(-1), positions.view(-1)
+        context_lens = (num_tokens + num_drafts_tensor).to(torch.int32)
+        if len(set(num_drafts)) == 1:
+            self.draft_layout = token_index.cuda(non_blocking=True), write_index.cuda(non_blocking=True), None
+            set_context(False, slot_mapping=slot_mapping.view(-1), context_lens=context_lens, block_tables=block_tables)
+            return input_ids.view(-1), positions.view(-1)
+        # Ragged: keep each sequence's first 1 + num_drafts rows, and a scratch row at the end that
+        # propose writes the drafts of the sequences without them to.
+        select = to_cuda([i * (k + 1) + j for i, num in enumerate(num_drafts) for j in range(1 + num)], torch.int64)    # rows of the (batch, k + 1) grid in use
+        device = input_ids.device
+        input_ids = torch.cat([input_ids.view(-1)[select], torch.zeros(1, dtype=torch.int64, device=device)])
+        positions = torch.cat([positions.view(-1)[select], torch.zeros(1, dtype=torch.int64, device=device)])
+        slot_mapping = torch.cat([slot_mapping.view(-1)[select], torch.full((1,), -1, dtype=torch.int32, device=device)])
+        self.draft_layout = token_index.cuda(non_blocking=True), write_index.cuda(non_blocking=True), num_drafts_tensor
+        cu_seqlens_q = [0]
+        for num in num_drafts:
+            cu_seqlens_q.append(cu_seqlens_q[-1] + 1 + num)
+        self.set_ragged_context(seqs, num_drafts, cu_seqlens_q, slot_mapping[:-1], context_lens, block_tables)
+        return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
@@ -366,7 +445,7 @@ class ModelRunner:
 
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         graphs = outputs = None
-        if self.graphs is not None and not is_prefill:
+        if self.graphs is not None and not is_prefill and get_context().cu_seqlens_q is None:    # a ragged batch runs eagerly
             q = input_ids.size(0) // get_context().context_lens.size(0)    # tokens per sequence in this step
             graphs, outputs = self.graphs[q], self.graph_vars["outputs"]
         return self.model.compute_logits(self.forward(self.model, graphs, outputs, input_ids, positions, is_prefill))
@@ -381,17 +460,24 @@ class ModelRunner:
         context = get_context()    # the target's
         context_lens, block_tables = context.context_lens, context.block_tables
         tokens, catchup_positions, catchup_slots = self.draft_inputs
+        token_index, write_index, num_drafts = self.draft_layout    # num_drafts: None unless the batch is ragged
         bs, m = tokens.shape
-        k = input_ids.numel() // bs - 1
-        input_ids = input_ids.view(bs, k + 1)
-        positions = positions.view(bs, k + 1)
-        slot_mapping = context.slot_mapping.view(bs, k + 1)
+        k = token_index.size(1) - 1
+        slot_mapping = context.slot_mapping
         for i in range(k):
             if i == 0:
                 q, step_positions, step_slots = m, catchup_positions, catchup_slots
+                step_context_lens = context_lens - k if num_drafts is None else context_lens - num_drafts
             else:    # the newest draft, at the position the target scores it
-                q, step_positions, step_slots = 1, positions[:, i], slot_mapping[:, i]
-            set_context(False, slot_mapping=step_slots.reshape(-1), context_lens=context_lens - k + i, block_tables=block_tables)
+                rows = token_index[:, i]
+                q, step_positions, step_slots = 1, positions[rows], slot_mapping[rows]
+                step_context_lens = context_lens - k + i
+                if num_drafts is not None:
+                    # A sequence with fewer drafts scores a dummy row (its last one again, its KV
+                    # masked) at its own context length, and its proposal goes to the scratch row.
+                    step_slots = torch.where(num_drafts > i, step_slots, -1)
+                    step_context_lens = context_lens - num_drafts + torch.minimum(num_drafts, torch.tensor(i, device=num_drafts.device))
+            set_context(False, slot_mapping=step_slots.reshape(-1), context_lens=step_context_lens, block_tables=block_tables)
             # Graphs exist for 1 and 2 tokens per sequence; a longer catch-up, after steps without drafts, runs eagerly.
             graphs, outputs = (self.draft_graphs.get(q), self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
             hidden_states = self.forward(self.draft_model, graphs, outputs, tokens.reshape(-1), step_positions.reshape(-1), False)
@@ -399,26 +485,42 @@ class ModelRunner:
             tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")
             if self.world_size > 1:
                 dist.broadcast(tokens, 0)
-            input_ids[:, i + 1] = tokens
+            input_ids[write_index[:, i]] = tokens
         restore_context(context)
-        return input_ids.view(-1)
+        return input_ids
+
+    def decode_logits(self, seqs: list[Sequence], is_prefill: bool) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """The step's inputs, drafts included, its logits, and its number of drafts (the most any
+        sequence has: with speculative_per_sequence a batch can be ragged, see ragged_layout)."""
+        k = 0 if is_prefill else max(seq.num_scheduled_tokens for seq in seqs) - 1
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        if self.draft_model is not None and k:
+            input_ids = self.propose(input_ids, positions)
+        n = sum(seq.num_scheduled_tokens for seq in seqs)    # a ragged batch's inputs end with a scratch row
+        logits = self.run_model(input_ids[:n], positions[:n], is_prefill)
+        if self.draft_model is not None and is_prefill:
+            self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
+        return input_ids, logits, k
+
+    def sample(self, seqs: list[Sequence], input_ids: torch.Tensor, logits: torch.Tensor, temperatures: torch.Tensor, k: int) -> torch.Tensor:
+        """The step's sampled tokens: one per sequence without drafts, else RejectionSampler's row
+        per sequence (its accepted drafts, one sampled token, -1 padding)."""
+        if not k:
+            return self.sampler(logits, temperatures)
+        if self.sampler_layout is None:
+            return self.rejection_sampler(logits, temperatures, input_ids[:len(seqs) * (k + 1)].view(len(seqs), k + 1)[:, 1:])
+        token_index, num_drafts = self.sampler_layout
+        return self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts)
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
-        k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        if self.draft_model is not None and k:
-            input_ids = self.propose(input_ids, positions)
-        logits = self.run_model(input_ids, positions, is_prefill)
-        if self.draft_model is not None and is_prefill:
-            self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
+        input_ids, logits, k = self.decode_logits(seqs, is_prefill)
         token_ids = None
-        if self.rank == 0 and not k:
-            token_ids = self.sampler(logits, temperatures).tolist()
-        elif self.rank == 0:
-            draft_token_ids = input_ids.view(len(seqs), -1)[:, 1:]
-            token_ids = accepted_token_ids(self.rejection_sampler(logits, temperatures, draft_token_ids).tolist())
+        if self.rank == 0:
+            token_ids = self.sample(seqs, input_ids, logits, temperatures, k).tolist()
+            if k:
+                token_ids = accepted_token_ids(token_ids)
         reset_context()
         return token_ids
 
@@ -426,26 +528,23 @@ class ModelRunner:
     def run_async(self, seqs: list[Sequence], is_prefill: bool) -> "AsyncOutput | None":
         """Like run, but returns before the GPU finishes. The sampled tokens stay on the GPU as
         inputs for the next decode step, and are copied to the host in the background."""
-        k = 0 if is_prefill else seqs[0].num_scheduled_tokens - 1    # drafts in this step
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        if self.draft_model is not None and k:
-            input_ids = self.propose(input_ids, positions)
-        logits = self.run_model(input_ids, positions, is_prefill)
-        if self.draft_model is not None and is_prefill:
-            self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
-        if self.rank == 0 and not k:
-            token_ids = self.sampler(logits, temperatures)
-        elif self.rank == 0:
-            token_ids = self.rejection_sampler(logits, temperatures, input_ids.view(len(seqs), -1)[:, 1:])
+        input_ids, logits, k = self.decode_logits(seqs, is_prefill)
+        if self.rank == 0:
+            token_ids = self.sample(seqs, input_ids, logits, temperatures, k)
         else:
             token_ids = torch.empty((len(seqs), k + 1) if k else len(seqs), dtype=torch.int64, device="cuda")
         if self.world_size > 1:
             dist.broadcast(token_ids, 0)    # every rank needs them as next-step inputs
         # With speculative decoding every step's output has a row per sequence, padded to the
-        # configured number of drafts (see AsyncOutput), whether or not this step drafted.
+        # configured number of drafts (see AsyncOutput), whether or not this step drafted all of them.
         K = self.num_speculative_tokens
-        self.last_token_ids = token_ids if token_ids.dim() == 2 or not K else torch.nn.functional.pad(token_ids.unsqueeze(1), (0, K), value=-1)
+        if K and token_ids.dim() == 1:
+            self.last_token_ids = torch.nn.functional.pad(token_ids.unsqueeze(1), (0, K), value=-1)
+        elif K and token_ids.size(1) < K + 1:
+            self.last_token_ids = torch.nn.functional.pad(token_ids, (0, K + 1 - token_ids.size(1)), value=-1)
+        else:
+            self.last_token_ids = token_ids
         reset_context()
         return AsyncOutput(token_ids) if self.rank == 0 else None
 

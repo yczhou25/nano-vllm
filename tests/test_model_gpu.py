@@ -43,6 +43,11 @@ ENGINE_OPTIONS = {
     # with a probe step now and then; the draft model's are mostly accepted (always, when it is the target itself).
     "spec_acceptance": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5},
     "draft_acceptance": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.5},
+    # The same per sequence: the questions' n-gram drafts get cut at different positions, so decode steps are ragged
+    # (varlen attention, no CUDA graph); the draft model's are mostly accepted, with the odd near-tie flipped by bf16 noise.
+    "spec_per_sequence": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5, "speculative_per_sequence": True},
+    "draft_per_sequence": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True},
+    "async_draft_per_sequence": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True},
 }
 
 
@@ -88,10 +93,12 @@ def generate(llm, prompts):
 def test_greedy_matches_reference(llm, reference):
     prompts = [chat(llm.tokenizer, q) for q in QUESTIONS]
     scheduler = llm.scheduler
-    scheduler.num_draft_tokens = scheduler.num_accepted_tokens = 0
+    scheduler.reset_stats()
     for prompt, completion in zip(prompts, generate(llm, prompts)):
         assert completion
         check(reference, prompt, completion)
+    if scheduler.speculative_per_sequence and not scheduler.has_draft_model:
+        assert scheduler.num_ragged_steps, "the questions' n-gram drafts should be cut at different positions"
     if scheduler.has_draft_model and scheduler.num_draft_tokens and os.path.samefile(DRAFT_MODEL, MODEL):
         # The target drafting for itself: every draft matches the greedy token unless bf16 noise
         # between the draft and verification passes flips a near-tie.

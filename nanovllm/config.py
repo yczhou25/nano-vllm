@@ -17,6 +17,7 @@ class Config:
     speculative_model: str | None = None    # a smaller model that drafts the speculative tokens; n-gram lookup if None
     speculative_disable_by_batch_size: int | None = None    # decode without drafts while more sequences than this are running
     speculative_min_acceptance: float | None = None    # decode without drafts while the measured draft acceptance rate is below this
+    speculative_per_sequence: bool = False    # with speculative_min_acceptance: a number of drafts per sequence, from its own acceptance rates
     hf_config: AutoConfig | None = None
     draft_hf_config: AutoConfig | None = None
     eos: int = -1
@@ -32,6 +33,7 @@ class Config:
             "n-gram drafts need the sampled tokens on the CPU; with async scheduling use a draft model (speculative_model)"
         assert self.speculative_disable_by_batch_size is None or (self.num_speculative_tokens and self.speculative_disable_by_batch_size >= 1)
         assert self.speculative_min_acceptance is None or (self.num_speculative_tokens and 0.0 <= self.speculative_min_acceptance <= 1.0)
+        assert not self.speculative_per_sequence or self.speculative_min_acceptance is not None, "speculative_per_sequence needs speculative_min_acceptance"
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if self.speculative_model is not None:

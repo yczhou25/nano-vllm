@@ -13,8 +13,13 @@ class Scheduler:
     # threshold (none: it runs without drafts), except one probe step with all K positions every
     # PROBE_INTERVAL steps, which is how later positions, and drafts at all, come back once the
     # workload changes.
+    # With speculative_per_sequence every sequence keeps its own rates (one sample per position
+    # per step) and gets its own number of drafts, so a batch can hold sequences with different
+    # numbers of drafts (a ragged batch, see ModelRunner.prepare_decode); it probes on its first
+    # step and every PROBE_INTERVAL steps of its own.
     ACCEPTANCE_WINDOW = 64    # sequence-steps per position, or ACCEPTANCE_MIN_STEPS steps if that is more
     ACCEPTANCE_MIN_STEPS = 8  # a large batch fills 64 samples in two steps, too few to decide on
+    ACCEPTANCE_WINDOW_PER_SEQUENCE = 16    # steps of one sequence: small, so a sequence that stops copying its prompt is noticed within a few steps
     PROBE_INTERVAL = 16       # decode steps
 
     def __init__(self, config: Config):
@@ -27,6 +32,7 @@ class Scheduler:
         self.has_draft_model = config.speculative_model is not None    # the model runner drafts on the GPU
         self.speculative_disable_by_batch_size = config.speculative_disable_by_batch_size
         self.speculative_min_acceptance = config.speculative_min_acceptance
+        self.speculative_per_sequence = bool(config.speculative_per_sequence) and self.num_speculative_tokens > 0
         # Per draft position (index 1..K): its acceptance rate over about the last ACCEPTANCE_WINDOW
         # sequence-steps that proposed it, and how many of those it has seen. Trusted until measured.
         self.acceptance = [1.0] * (self.num_speculative_tokens + 1)
@@ -41,6 +47,9 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if self.speculative_per_sequence:    # trusted until measured, like the batch-wide rates
+            seq.acceptance = [1.0] * (self.num_speculative_tokens + 1)
+            seq.num_acceptance_samples = [0] * (self.num_speculative_tokens + 1)
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
@@ -78,17 +87,20 @@ class Scheduler:
 
         # decode
         k = self.num_speculative_tokens
-        if k and self.speculative_disable_by_batch_size is not None and len(self.running) > self.speculative_disable_by_batch_size:
+        capped = k and self.speculative_disable_by_batch_size is not None and len(self.running) > self.speculative_disable_by_batch_size
+        if capped:
             k = 0    # a batch this large keeps the GPU busy by itself; the k extra positions would not be free
-        if k and self.speculative_min_acceptance is not None and self.num_steps_without_probe < self.PROBE_INTERVAL:
+        per_sequence = k > 0 and self.speculative_per_sequence    # each sequence picks its own number of drafts below
+        if k and self.speculative_min_acceptance is not None and not per_sequence and self.num_steps_without_probe < self.PROBE_INTERVAL:
             k = self.num_acceptable_drafts()    # positions rejected too often are left out; the next probe step measures them again
-        num_decode_tokens = 1 + k
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             if seq.num_completion_tokens + seq.num_inflight >= seq.max_tokens:    # the step in flight may finish it
                 kept_seqs.append(seq)
                 continue
+            num_drafts = self.num_acceptable_drafts(seq) if per_sequence else k
+            num_decode_tokens = 1 + num_drafts
             while not self.block_manager.can_append(seq, num_decode_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -99,29 +111,46 @@ class Scheduler:
                 seq.num_scheduled_tokens = num_decode_tokens
                 seq.is_prefill = False
                 if self.proposer:
-                    seq.draft_token_ids = self.proposer.propose(seq)[:k] if k else []
+                    seq.draft_token_ids = self.proposer.propose(seq)[:num_drafts] if num_drafts else []
                 self.block_manager.may_append(seq, num_decode_tokens)
                 scheduled_seqs.append(seq)
                 kept_seqs.append(seq)
+                if per_sequence:
+                    seq.num_steps_without_probe = 0 if num_drafts == self.num_speculative_tokens else seq.num_steps_without_probe + 1
+                    self.num_steps_by_k[num_drafts] += 1    # sequence-steps in this mode
         self.running.extendleft(reversed(kept_seqs))
         if scheduled_seqs:
-            self.num_steps_without_probe = 0 if k == self.num_speculative_tokens else self.num_steps_without_probe + 1
-            self.num_steps_by_k[k] += 1
+            self.num_decode_steps += 1
+            self.num_capped_steps += bool(capped)
+            if per_sequence:
+                self.num_ragged_steps += len({seq.num_scheduled_tokens for seq in scheduled_seqs}) > 1
+            else:
+                self.num_steps_without_probe = 0 if k == self.num_speculative_tokens else self.num_steps_without_probe + 1
+                self.num_steps_by_k[k] += 1
         return scheduled_seqs, False
 
     def reset_stats(self):
         """Speculative decoding statistics (cumulative, unlike the acceptance window): drafts proposed
-        and accepted in all, per draft position, and decode steps by their number of drafts."""
+        and accepted in all, per draft position, decode steps by their number of drafts (with
+        speculative_per_sequence: sequence-steps), decode steps, and the ragged and capped ones among them."""
         k = self.num_speculative_tokens
         self.num_draft_tokens = self.num_accepted_tokens = 0
         self.num_proposed_by_position = [0] * (k + 1)
         self.num_accepted_by_position = [0] * (k + 1)
         self.num_steps_by_k = [0] * (k + 1)
+        self.num_decode_steps = self.num_ragged_steps = self.num_capped_steps = 0    # capped: drafts off by speculative_disable_by_batch_size
 
-    def num_acceptable_drafts(self) -> int:
-        """The leading draft positions whose measured acceptance rate reaches the threshold."""
+    def num_acceptable_drafts(self, seq: Sequence | None = None) -> int:
+        """The leading draft positions whose measured acceptance rate reaches the threshold: the
+        batch's rates, or with a sequence its own, which proposes every position on its first step
+        (nothing measured yet) and on every PROBE_INTERVAL-th step of its own."""
+        acceptance = self.acceptance
+        if seq is not None:
+            if seq.num_steps_without_probe >= self.PROBE_INTERVAL:
+                return self.num_speculative_tokens
+            acceptance = seq.acceptance
         k = 0
-        while k < self.num_speculative_tokens and self.acceptance[k + 1] >= self.speculative_min_acceptance:
+        while k < self.num_speculative_tokens and acceptance[k + 1] >= self.speculative_min_acceptance:
             k += 1
         return k
 
@@ -179,19 +208,27 @@ class Scheduler:
                     start = seq.num_cached_tokens
                     num_tokens = seq.num_tokens - start - 1
                     seq.num_cached_tokens = start + num_tokens
-                    if speculative or not self.has_draft_model:
+                    if num_drafts or not self.has_draft_model:
                         # A step with drafts first caught the draft model's KV cache up to the newest
                         # token (ModelRunner.propose), then scored every draft but the last one, so when
                         # all of them were accepted the cache lacks the newest cached token. A step
-                        # without drafts (see schedule) skips the draft model: its cache falls behind
-                        # until the next step with drafts, and the blocks it lacks must not be hashed
-                        # yet, or a prefix cache hit would read a stale draft KV.
+                        # without drafts (see schedule), or a sequence without drafts in a ragged step,
+                        # skips the draft model: its cache falls behind until the next step with drafts,
+                        # and the blocks it lacks must not be hashed yet, or a prefix cache hit would
+                        # read a stale draft KV.
                         lag = self.has_draft_model and len(new_token_ids) == num_drafts + 1    # every draft accepted
                         seq.num_draft_cached_tokens = seq.num_cached_tokens - lag
                 if speculative:
                     for j in range(1, num_drafts + 1):
                         proposed[j] += 1
                         accepted[j] += j < len(new_token_ids)
+                    if self.speculative_per_sequence and num_drafts:
+                        # The sequence's own running mean per position, over its last ACCEPTANCE_WINDOW_PER_SEQUENCE steps that proposed it.
+                        window = self.ACCEPTANCE_WINDOW_PER_SEQUENCE
+                        for j in range(1, num_drafts + 1):
+                            seen = min(seq.num_acceptance_samples[j], window)
+                            seq.acceptance[j] = (seq.acceptance[j] * seen + (j < len(new_token_ids))) / (seen + 1)
+                            seq.num_acceptance_samples[j] = min(seen + 1, window)
             if seq.block_table:    # empty if preempted while this step was in flight
                 # Blocks both KV caches hold completely; the ones a lagging draft cache left for later are hashed
                 # once it catches up (hash_blocks scans back to them).

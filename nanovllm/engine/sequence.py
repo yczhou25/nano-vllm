@@ -28,6 +28,11 @@ class Sequence:
         self.inflight_row = -1      # row of this sequence in the in-flight step's output
         self.draft_token_ids = []   # tokens proposed for this decode step (speculative decoding with n-gram drafts)
         self.num_draft_cached_tokens = 0    # positions a draft model's KV cache holds; it may lag num_cached_tokens (see Scheduler.postprocess)
+        # Per draft position (index 1..K): this sequence's own acceptance rate and samples, and its
+        # decode steps since it last proposed every position (Scheduler with speculative_per_sequence).
+        self.acceptance = None
+        self.num_acceptance_samples = None
+        self.num_steps_without_probe = 0
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature

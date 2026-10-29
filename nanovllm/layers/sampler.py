@@ -24,11 +24,22 @@ class RejectionSampler(nn.Module):
     keep drafts that match the argmax."""
 
     @torch.compile(dynamic=True)
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, draft_token_ids: torch.Tensor):
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, draft_token_ids: torch.Tensor,
+                token_index: torch.Tensor | None = None, num_drafts: torch.Tensor | None = None):
         """logits: (batch_size * (k + 1), vocab_size); draft_token_ids: (batch_size, k).
-        Returns (batch_size, k + 1) token ids: the accepted drafts, one sampled token, then -1."""
+        Returns (batch_size, k + 1) token ids: the accepted drafts, one sampled token, then -1.
+
+        A ragged batch, whose sequences have different numbers of drafts (see
+        ModelRunner.ragged_sampler_inputs), passes logits of sum(1 + k_i) rows, token_index
+        (batch_size, K + 1) with the row of each sequence's input token and of its drafts, padded
+        by repeating its last row, draft_token_ids padded the same way, and num_drafts (batch_size,)
+        with each k_i: the padded positions count as rejected."""
         batch_size, k = draft_token_ids.shape
-        logits = logits.view(batch_size, k + 1, -1)
+        if token_index is None:
+            logits = logits.view(batch_size, k + 1, -1)
+            num_drafts = k
+        else:
+            logits = logits[token_index]
         greedy = temperatures == 0
         temperatures = temperatures.clamp_min(1e-10).unsqueeze(dim=1)
         draft_logits = logits[:, :k].gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).float()
@@ -36,13 +47,15 @@ class RejectionSampler(nn.Module):
         draft_probs = torch.exp(draft_logits / temperatures - log_norms)
         accepted = torch.where(greedy.unsqueeze(dim=1), logits[:, :k].argmax(dim=-1) == draft_token_ids,
                                torch.rand_like(draft_probs) < draft_probs)
+        if token_index is not None:
+            accepted &= torch.arange(k, device=logits.device) < num_drafts.unsqueeze(dim=1)
         num_accepted = accepted.int().cumprod(dim=1).sum(dim=1)
         # Sample the token after the accepted drafts, with the rejected draft (if any) removed.
         rows = torch.arange(batch_size, device=logits.device)
         last_logits = logits[rows, num_accepted].float()
         rejected = draft_token_ids.gather(1, num_accepted.clamp_max(k - 1).unsqueeze(dim=1))
         keep = last_logits.gather(1, rejected)
-        last_logits.scatter_(1, rejected, torch.where((num_accepted < k).unsqueeze(dim=1), float("-inf"), keep))
+        last_logits.scatter_(1, rejected, torch.where((num_accepted < num_drafts).unsqueeze(dim=1), float("-inf"), keep))
         greedy_tokens = last_logits.argmax(dim=-1)
         probs = torch.softmax(last_logits.div_(temperatures), dim=-1)
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
