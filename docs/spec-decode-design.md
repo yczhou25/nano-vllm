@@ -381,13 +381,14 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 - **GPU 上复测（作业 231468，开着 `TORCH_LOGS=recompiles`）却没好**：开关行 961.9 对基线 1038.6（×0.93）。日志里 186 条 Recompiling 说明了原因：每一行（包括基线）在第一个真实请求时把所有编译过的层（两个 layernorm、rotary、activation）和两个采样器**全部重编译一遍**，守卫是 `utils_device.CURRENT_DEVICE == device('cuda')`——`ModelRunner` 加载模型和预热时把 torch 的默认设备设成 cuda，服务时又改回 cpu，而 `torch.compile` 会对默认设备加守卫。所以启动时的预热全部作废；bench 自己的预热调用把这一串重编译挡在了计时器外面，但那一次是 batch 1 的 prompt，于是采样器被 0/1 特化成 batch 1，计时区间里再重编译两次（`temperatures` 从 1 到 32；`2 <= draft_token_ids.size()[1]`，k 从 ≥2 到 1）。对真实用户来说这是第一个请求的延迟：十几次编译、几十秒。
 - **第二版修法**：预热和 CUDA graph 捕获都挪到默认设备恢复成 cpu 之后，预热用的张量显式写 `device="cuda"` 和模型的 dtype（ac3f3be）。
 - **复测（作业 231709，`docs/benchmarks/qwen3-8b-a40-adaptive-k5.txt`）**：默认设备那条守卫没了（日志从 186 条降到 134 条，层不再重编译），但开关行还是 ×0.94（829.7 对基线 880.2 / 880.8，关草稿 881.0）。剩下的守卫是 `requires_grad mismatch`：`ModelRunner.run` / `run_async` 没有放在 `torch.inference_mode` 下（只有模型的 forward 在），所以真实步的 lm_head logits 带着 autograd、预热的不带，两个采样器在第一个真实步又编了一遍；之后照旧被 bench 的 batch 1 预热 0/1 特化，再加一条 stride 守卫（真实草稿是 `input_ids.view(B, q)[:, 1:]`，stride 是 (q, 1)，预热用的是连续张量），拒绝采样器在计时区间里又编了两次。草稿模型那两行照样是 ×1.08（固定 k=4，953.4）和 ×1.20（K=4 + 开关，1052.4）。
-- **第三版修法**：`run` / `run_async` 加 `@torch.inference_mode()`，采样器预热也在 inference mode 下跑，草稿用 `(batch, q)` 张量的列切片。CPU 上开着重编译日志：预热编 6 张图，之后 bench 式的服务序列零编译。复测作业 `cluster/nanovllm-adaptive-k6-a40.sbatch`（同样的 8 行）。
+- **第三版修法**：`run` / `run_async` 加 `@torch.inference_mode()`，采样器预热也在 inference mode 下跑，草稿用 `(batch, q)` 张量的列切片。CPU 上开着重编译日志：预热编 6 张图，之后 bench 式的服务序列零编译。
+- **复测（作业 232099，2026-10-28，代码 0e2b732，`docs/benchmarks/qwen3-8b-a40-adaptive-k6.txt`）**：开关行 871.8 对基线 881.2 / 881.6（×0.99，231709 里是 ×0.94），batch 8 上 249.9 对 251.6（×0.99，原来 ×0.94），关草稿 881.4 照旧免费；草稿模型固定 k=4 1000.3（×1.14）、K=4 + 开关 1060.7（×1.20）。重编译日志 117 条，没有一条 `requires_grad`，采样器的编译全部落在每行启动后 13 秒内（启动预热里 batch 1 和草稿宽 1 的 0/1 特化，以及它们之后的符号图），计时区间里一次都没有——231709 里开关行是在 +74 s 和 +87 s 重编译的。到这里 228654 那 12 个点算清了：7 个点是两台 A40 的差别，4 个点是启动编译漏进计时区间，1 个点是探测。
 
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。
 - ngram 版和异步调度合并：要把 ngram 查找搬到 GPU 上（vLLM 的做法是 CPU 上查、但等上一步落地，等于放弃了异步）。草稿模型版已经合并（见上）。
-- k 自适应：按 batch 大小关草稿已做并复测（batch 32 关草稿时 edit ×0.98、chat ×1.00）；按每个草稿位的接受率调 k 已做并同场复测（草稿模型上 edit batch 1 ×3.2、chat batch 32 ×1.19，固定 k=4 只有 ×1.04；n-gram 在 chat batch 32 上从 ×0.74 回到 ×0.88，剩下的差距在查，见上）。还没做的是每条序列一个 k（混合负载需要），把 batch 大小的阈值按 target 何时算力受限来定（这台 A40 上 8B + 0.6B 用 8 太低），以及让 K 本身跟着负载走。
+- k 自适应：按 batch 大小关草稿已做并复测（batch 32 关草稿时 edit ×0.98、chat ×1.00）；按每个草稿位的接受率调 k 已做并同场复测（草稿模型上 edit batch 1 ×3.2、chat batch 32 ×1.19，固定 k=4 只有 ×1.04；n-gram 在 chat batch 32 上从 ×0.74 回到 ×0.99，差距查清是三条 `torch.compile` 守卫，见上）。还没做的是每条序列一个 k（混合负载需要），把 batch 大小的阈值按 target 何时算力受限来定（这台 A40 上 8B + 0.6B 用 8 太低），以及让 K 本身跟着负载走。
 - 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：温度采样下接受率更高，要多存 `(B, k, V)` 的 q。
 - EAGLE-3 草稿头（可选）。
 - ngram 索引在 CPU 上：长 prompt 第一次 decode 要建索引，每个 token 4 次字典写入。

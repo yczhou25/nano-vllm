@@ -1,0 +1,8 @@
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=32 T=0.0 tokens=31064 time=35.25s throughput=881.2tok/s acceptance=0.000 acc_pos= k_steps=1022
+workload=chat drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=16 batch=32 T=0.0 tokens=31212 time=35.80s throughput=871.8tok/s acceptance=0.098 acc_pos=0.18,0.10,0.06,0.03 k_steps=928,23,0,0,60
+workload=chat drafter=ngram k=4 async=0 disable_by=1 min_acc=None probe=16 batch=32 T=0.0 tokens=31064 time=35.24s throughput=881.4tok/s acceptance=0.000 acc_pos=-,-,-,- k_steps=1022,0,0,0,0
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=32 T=0.0 tokens=31064 time=35.24s throughput=881.6tok/s acceptance=0.000 acc_pos= k_steps=1022
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 batch=8 T=0.0 tokens=7840 time=31.16s throughput=251.6tok/s acceptance=0.000 acc_pos= k_steps=1022
+workload=chat drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=16 batch=8 T=0.0 tokens=7770 time=31.09s throughput=249.9tok/s acceptance=0.102 acc_pos=0.19,0.09,0.07,0.04 k_steps=936,15,0,0,60
+workload=chat drafter=model k=4 async=0 disable_by=None min_acc=None probe=16 batch=32 T=0.0 tokens=31320 time=31.31s throughput=1000.3tok/s acceptance=0.407 acc_pos=0.64,0.45,0.31,0.22 k_steps=0,0,0,0,462
+workload=chat drafter=model k=4 async=0 disable_by=None min_acc=0.2 probe=16 batch=32 T=0.0 tokens=31100 time=29.32s throughput=1060.7tok/s acceptance=0.465 acc_pos=0.66,0.46,0.32,0.24 k_steps=0,0,88,236,155
