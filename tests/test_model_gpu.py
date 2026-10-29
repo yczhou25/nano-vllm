@@ -49,8 +49,8 @@ ENGINE_OPTIONS = {
     "draft_per_sequence": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True},
     "async_draft_per_sequence": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True},
     # The same with ragged batches padded to the fixed width (dummy rows, CUDA graphs) instead of varlen attention.
-    "spec_per_sequence_pad": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5, "speculative_per_sequence": True, "speculative_ragged": "pad"},
-    "async_draft_per_sequence_pad": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True, "speculative_ragged": "pad"},
+    "spec_per_sequence_varlen": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5, "speculative_per_sequence": True, "speculative_ragged": "varlen"},
+    "async_draft_per_sequence_varlen": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True, "speculative_ragged": "varlen"},
 }
 
 
@@ -73,8 +73,9 @@ def reference(llm):
     return AutoModelForCausalLM.from_pretrained(MODEL).float().cuda().eval()
 
 
-def chat(tokenizer, text):
-    return tokenizer.encode(tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True))
+def chat(tokenizer, text, thinking=True):
+    # Qwen3 thinks before it answers unless the template is told not to (bench_spec.py turns it off).
+    return tokenizer.encode(tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True, enable_thinking=thinking))
 
 
 @torch.inference_mode()
@@ -125,12 +126,14 @@ COPY_TEXT = " ".join(f"Sentence {i}: the scheduler batches requests, the block m
 def test_ragged_batch_matches_reference(llm, reference):
     # speculative_per_sequence: a copying task keeps its n-gram drafts (the text is in its prompt)
     # while the questions lose theirs, so the batch decodes with different numbers of drafts per
-    # sequence (ragged steps: varlen attention, no CUDA graph, the sampler's ragged branch). With
-    # the target drafting for itself, only a near-tie flipped by bf16 noise cuts a sequence.
+    # sequence (ragged steps, padded or varlen, and the sampler's ragged branch). With the target
+    # drafting for itself, only a near-tie flipped by bf16 noise cuts a sequence. Thinking is off:
+    # with it on, the copying task spends its MAX_TOKENS thinking and never starts to copy (A40
+    # jobs 233732 and 234187 saw no ragged step at all).
     scheduler = llm.scheduler
     if not scheduler.speculative_per_sequence:
         pytest.skip("per-sequence k only")
-    prompts = [chat(llm.tokenizer, f"Repeat the following text exactly, word for word:\n\n{COPY_TEXT}")] + [chat(llm.tokenizer, q) for q in QUESTIONS]
+    prompts = [chat(llm.tokenizer, f"Repeat the following text exactly, word for word:\n\n{COPY_TEXT}", thinking=False)] + [chat(llm.tokenizer, q, thinking=False) for q in QUESTIONS]
     scheduler.reset_stats()
     for prompt, completion in zip(prompts, generate(llm, prompts)):
         assert completion

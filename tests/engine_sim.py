@@ -39,7 +39,7 @@ class Violation(AssertionError):
 
 
 def make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, eos=EOS, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="varlen"):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad"):
     # Config itself requires a model directory and block sizes that are multiples of 256.
     return types.SimpleNamespace(num_kvcache_blocks=num_blocks, kvcache_block_size=block_size,
                                  max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens, eos=eos,
@@ -65,7 +65,7 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
 
 
 def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="varlen"):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad"):
     assert not (async_scheduling and num_speculative_tokens and not draft_model)
     engine = LLMEngine.__new__(LLMEngine)
     engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens,

@@ -390,7 +390,7 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 
 ### 做法
 
-- **统计和决定（调度器）**：每条序列有自己的 `acceptance[1..K]`。窗口 `ACCEPTANCE_WINDOW_PER_SEQUENCE` = 16 步（一条序列每步每位只有一个样本，满窗口后每步按 1/17 替换；窗口小是故意的，一条序列从“抄 prompt”切到“自由生成”要在几步内被发现）。每个 decode 步对每条序列算 `num_acceptable_drafts(seq)`：最长的够阈值的前缀，没测过先信任（新序列第一步提满 K），但信任背后垫着 `ACCEPTANCE_PRIOR_PER_SEQUENCE` = 1 个“接受”的先验样本：一条序列每步每位只有一个样本，没有先验时开头一次没中这一位就是 0，要等下一次探测（16 步）才回来；有先验是 1/2，再没中一次才砍。这是作业 233732 的混合 batch GPU 用例抓到的：抄写任务第一步的 n-gram 草稿必然不中（prompt 末尾的聊天模板在前文没出现过），四个问题在它的下一次探测之前就答完了，整场没有一个 ragged 步。探测还是整个 batch 的：`PROBE_INTERVAL` 个“有序列没提满 K”的步之后，所有序列同一步都提 K，这是一个统一形状的步，走 CUDA graph。第一版（5b62af5）让每条序列各自计数、各自探测，A40 作业 233573 里 chat 上 21% 的步因此变成 ragged 步（各序列的探测落在不同的步，每个都是 eager 步），n-gram 开关从 ×0.99 掉到 ×0.95；改成 batch 同步之后探测步和 batch 级开关一样。`num_scheduled_tokens = 1 + num_drafts_i`，块分配按各自的数，n-gram 提案截到各自的数。batch 大小规则优先（超过就全部 0）。batch 平均的接受率照旧统计（`acc_pos=` 还是它），`num_steps_by_k` 在这个模式里数的是序列-步；另加 `num_decode_steps` / `num_ragged_steps`（各序列草稿数不同的步）/ `num_capped_steps`（被 batch 大小规则清零的步），bench 打印成 `ragged=` 和 `capped=` 两个比例。
+- **统计和决定（调度器）**：每条序列有自己的 `acceptance[1..K]`。窗口 `ACCEPTANCE_WINDOW_PER_SEQUENCE` = 16 步（一条序列每步每位只有一个样本，满窗口后每步按 1/17 替换；窗口小是故意的，一条序列从“抄 prompt”切到“自由生成”要在几步内被发现）。每个 decode 步对每条序列算 `num_acceptable_drafts(seq)`：最长的够阈值的前缀，没测过先信任（新序列第一步提满 K），但信任背后垫着 `ACCEPTANCE_PRIOR_PER_SEQUENCE` = 1 个“接受”的先验样本：一条序列每步每位只有一个样本，没有先验时开头一次没中这一位就是 0，要等下一次探测（16 步）才回来；有先验是 1/2，再没中一次才砍。先验是在查作业 233732 的 GPU 混合 batch 用例（抄写任务加四个问题，必须出现 ragged 步，结果一个都没有）时加的，当时以为是抄写任务开头一次没中就丢了 16 步草稿；先验本身该有，但不是那个用例的原因——作业 234187 带着先验照样 0 个 ragged 步。真正的原因是 GPU 测试的 prompt 开着 Qwen3 的思考模式（`bench_spec.py` 早就 `enable_thinking=False`，测试的 `chat()` 没有）：抄写任务先想满 64 个 token，根本没开始抄，n-gram 自然一个都不中，五条序列全是 0 草稿，形状当然统一。用例改成关思考，下一次 GPU 作业验证。探测还是整个 batch 的：`PROBE_INTERVAL` 个“有序列没提满 K”的步之后，所有序列同一步都提 K，这是一个统一形状的步，走 CUDA graph。第一版（5b62af5）让每条序列各自计数、各自探测，A40 作业 233573 里 chat 上 21% 的步因此变成 ragged 步（各序列的探测落在不同的步，每个都是 eager 步），n-gram 开关从 ×0.99 掉到 ×0.95；改成 batch 同步之后探测步和 batch 级开关一样。`num_scheduled_tokens = 1 + num_drafts_i`，块分配按各自的数，n-gram 提案截到各自的数。batch 大小规则优先（超过就全部 0）。batch 平均的接受率照旧统计（`acc_pos=` 还是它），`num_steps_by_k` 在这个模式里数的是序列-步；另加 `num_decode_steps` / `num_ragged_steps`（各序列草稿数不同的步）/ `num_capped_steps`（被 batch 大小规则清零的步），bench 打印成 `ragged=` 和 `capped=` 两个比例。
 - **输入布局（`ModelRunner.ragged_layout`）**：decode 步的输入按序列拼成一维，序列 i 占 `1 + num_drafts_i` 行（最后一个 token，然后它的草稿）。布局函数返回三个张量：`token_index (B, 1+max k)`，每条序列各行的行号，不够的重复它最后一行；`write_index (B, max k)`，第 i 个草稿写到哪一行，没有这个草稿的序列写到末尾多出的一行 scratch 行；`num_drafts (B,)`。所有序列草稿数相同的步（含全 0）就是原来的 `(B, k+1)` 网格，走原来的路：`flash_attn_with_kvcache`、CUDA graph、按 view 切草稿的拒绝采样。只有草稿数不同的步（ragged 步）走下面的新路。
 - **注意力**：ragged 步设置 `cu_seqlens_q`，注意力层走 chunked prefill 那条路：`flash_attn_varlen_func` 带 `block_table` 读整个 KV cache，causal 掩码右下角对齐，每条序列的 q 长度不同也没关系。`cu_seqlens_q` 在 CPU 算；`cu_seqlens_k` 在 GPU 上从 `context_lens` 累加，因为异步调度下在途 token 数只有 GPU 知道（CPU 给一个上界当 `max_seqlen_k`）。ragged 步不走 CUDA graph（eager），这是它的代价，要在 GPU 上量。
 - **拒绝采样器**：多一个分支，输入 `token_index` 和 `num_drafts`：先按 `token_index` gather 出 `(B, k+1, V)` 的 logits（补齐的位重复最后一行），正常算接受，再把补齐的位强制算拒绝（`accepted &= arange(k) < num_drafts`），“全接受要从最后一行采 bonus”按各自的 `num_drafts` 判断。每条序列的输出和它单独放在一个 k=num_drafts_i 的统一 batch 里完全一样（有测试逐条比）。
@@ -451,26 +451,44 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 - edit batch 32 回归正常：草稿模型开关 batch 级 1008.7（×1.46）、按序列 1005.2（×1.46，6% ragged）。两次混合基线 846.2 / 845.1。
 - 两行没出数（混合 batch 32 的 eager 基线、chat batch 32 草稿模型开关 batch 级）：进程一行都没打就退了，日志里没有 traceback 也没有 Killed。第三次作业的脚本记每一行的退出码，没出结果行的重跑一次。
 - 重编译查过了：日志里 292 次 `Recompiling` 全在计时之前（基线一行 12 次、固定 k=4 17 次、开关 21 次、按序列 23 次，多的两次是 ragged 采样分支 k=1 和 k≥2 的预热；每一行最后一次重编译都是 bench 计时前那条 63 个 token 的预热 prefill）。在 CPU 上也验了一遍：预热之后，varlen 和 pad 两种布局、各种 batch 和草稿数的 ragged 步都不再编译。
-- GPU 测试 42/44（8 个跳过）：挂的是 n-gram 两种按序列模式的混合 batch 用例，输出和参考一致，但 `num_ragged_steps == 0`。原因在上面做法里说了（一个样本就把抄写任务的接受率打到 0，16 步没草稿，问题先答完了），已在 cc2a84a 加一个先验样本修掉。
+- GPU 测试 42/44（8 个跳过）：挂的是 n-gram 两种按序列模式的混合 batch 用例，输出和参考一致，但 `num_ragged_steps == 0`。当时判断是一个样本就把抄写任务的接受率打到 0，在 cc2a84a 加了先验样本；234187 证明不是（见下），原因在做法一节。
 
 结论：varlen 模式下按序列的 k 不能做默认。它该赢的地方（接受率）赢了，输在每个 ragged 步都是 eager；要么 pad 模式把 graph 保住（第三次作业 234187，varlen 对 pad，同一场跑），要么按序列只在 batch 很小、行几乎免费的时候开。
 
 ### ragged 步的第二种跑法：补空行、保住 CUDA graph（2026-10-29 加）
 
-`LLM(..., speculative_ragged="pad")`（默认 `"varlen"`）。上面 batch 8 的教训是 ragged 步不能 eager。原来想的是按总行数分桶给 varlen kernel 抓 CUDA graph，但有个更省事的做法，就是草稿模型追赶步已经在用的那一招：**所有序列都算 k_max+1 行，草稿少的序列在前面补空行，自己的行靠右对齐**。`flash_attn_with_kvcache` 的因果掩码按右下角对齐（最后一个 query 对准 `cache_seqlens-1`），所以序列 i 的真实行 j 正好看到 `L_i-1+j` 之前的 key，和它单独算一模一样；前面的空行看到的 key 更少，输出是垃圾，但 slot 置 -1 不写 KV、位置夹到 0，采样器按 `token_index` 只取真实行。于是 ragged 步和统一形状的步走同一条路：同一个 kernel、同一套按 q 抓的 CUDA graph、同一个采样器分支（`token_index` 换成 padded 布局），`propose` 一行不改（草稿少的序列的多余提案写进它自己的空行）。
+`LLM(..., speculative_ragged="pad")`（作业 234187 之后是默认值；`"varlen"` 留着）。上面 batch 8 的教训是 ragged 步不能 eager。原来想的是按总行数分桶给 varlen kernel 抓 CUDA graph，但有个更省事的做法，就是草稿模型追赶步已经在用的那一招：**所有序列都算 k_max+1 行，草稿少的序列在前面补空行，自己的行靠右对齐**。`flash_attn_with_kvcache` 的因果掩码按右下角对齐（最后一个 query 对准 `cache_seqlens-1`），所以序列 i 的真实行 j 正好看到 `L_i-1+j` 之前的 key，和它单独算一模一样；前面的空行看到的 key 更少，输出是垃圾，但 slot 置 -1 不写 KV、位置夹到 0，采样器按 `token_index` 只取真实行。于是 ragged 步和统一形状的步走同一条路：同一个 kernel、同一套按 q 抓的 CUDA graph、同一个采样器分支（`token_index` 换成 padded 布局），`propose` 一行不改（草稿少的序列的多余提案写进它自己的空行）。
 
-代价是多算的空行：batch 32 混合负载里 16 条 k=4、16 条 k=0 的步，varlen 算 96 行，pad 算 160 行；n-gram 在 chat batch 32 上 k=4（160 行、全拒）比不投机慢 35%（作业 225010），所以 batch 大时空行不是免费的，而 varlen 的 eager 只亏 4%。batch 8 时反过来：行几乎免费，eager 亏 11%。两种模式都留着，第三次作业（234187）在 batch 8 和 32 上各测一遍再定默认值（或者按行数自动选）。作业 233732 之后更清楚了：batch 8 上 graph 值 25%，草稿模型的提案步比 target 更怕 eager，所以 pad 模式要保住的不只是 target 那 4%。
+代价是多算的空行：batch 32 混合负载里 16 条 k=4、16 条 k=0 的步，varlen 算 96 行，pad 算 160 行；n-gram 在 chat batch 32 上 k=4（160 行、全拒）比不投机慢 35%（作业 225010），所以 batch 大时空行不是免费的，而 varlen 的 eager 只亏 4%。batch 8 时反过来：行几乎免费，eager 亏 11%。两种模式都留着，第三次作业（234187）在 batch 8 和 32 上各测一遍再定默认值，结果在下面。
 
 - `ModelRunner.ragged_layout(num_drafts, pad=True)`：每条序列 `1+k` 行，`token_index` 指向靠右的真实行，`write_index` 里没有的草稿指向本序列的空行（不再需要 scratch 行）。
 - n-gram 路径：按序列先放 `k - k_i` 个空行（token 0、位置 0、slot -1）再放真实行；context 和统一步一样。草稿模型路径：位置 `L-1+c-front` 夹到 0，slot 按 `c >= front` 屏蔽，最后一个 token 放到第 `front` 列；追赶步不变。
 - 模拟器：`_perseq` 模式里 varlen 和 pad 随机各半；pad 步必须没有 `cu_seqlens_q`（走 graph 那条路）、布局和 `ragged_layout(pad=True)` 一致、空行 slot 都是 -1、真实行的位置/slot/KV 检查照旧，采样器用 padded 布局。注入 5 种 bug（空行不屏蔽 slot、输入 token 放错列、n-gram 空行写 KV、多余草稿写进别的序列的行、pad 步仍设 varlen context），30 个种子里各有 17–18 个用例抓到。
-- GPU 测试加 `spec_per_sequence_pad`、`async_draft_per_sequence_pad`。
+- GPU 测试加 `spec_per_sequence_pad`、`async_draft_per_sequence_pad`（pad 成默认之后改名为 `_varlen` 两种）。
+
+### 实测（作业 234187，2026-10-29，代码 cc2a84a，49 分钟）：varlen 对 pad，和按序列 k 的结论
+
+脚本 `cluster/nanovllm-perseq3-a40.sbatch`（第一次提交 233916 和 233732 同一秒启动，抢同一个 checkout 的 `.git/index.lock` 死了，脚本加了重试再交），19 行全部出数（脚本记每行退出码、没结果行就重跑一次，这次没用上）。同一场里每个负载/batch 先跑基线，原始行在 `docs/benchmarks/qwen3-8b-a40-perseq.txt`：
+
+- 混合 batch 8：基线 251.5；草稿模型开关 batch 级 347.6（×1.38）；按序列 varlen 263.3（×1.05，78% ragged）、**pad 312.8（×1.24）**；n-gram 按序列 varlen 207.8（×0.83）、pad 242.6（×0.96）。
+- 混合 batch 32：基线 844.5；草稿模型开关 batch 级 945.9（×1.12）；按序列 varlen 862.4（×1.02）、pad 839.4（×0.99）；n-gram 开关 batch 级 780.5（×0.92）、按序列 varlen 740.8（×0.88）、pad 725.4（×0.86）。
+- chat batch 32：基线 1038.0；n-gram 按序列 varlen 882.1（×0.85，50% ragged）、pad 984.2（×0.95）；草稿模型按序列 varlen 1005.1（×0.97）、pad 1059.3（×1.02）。
+- 漂移：混合 batch 8 基线 251.5 / 252.3。
+
+两个结论：
+
+1. **pad 对 varlen**：batch 8 上 pad 赢 19%（草稿模型）和 17%（n-gram），chat batch 32 上赢 5% 和 12%；只有混合 batch 32 上 varlen 赢 2–3%（96 行对 160 行，这个 batch 下行不再免费）。默认改成 `"pad"`。
+2. **按序列 k 本身，在这台 A40、8B + 0.6B 的组合上，哪一格都没赢过 batch 级开关**：混合 batch 8 ×1.24 对 ×1.38，batch 32 ×1.02 对 ×1.12，chat batch 32 草稿模型 ×1.02（batch 级在 233573 里 ×1.20）。接受率确实涨了（草稿模型 0.57 → 0.63，n-gram 0.27 → 0.43），输出逐 token 和参考一致，机制是对的，输在两种 ragged 步各有一笔省不回来的账：varlen 省了行，丢了 CUDA graph（batch 8 上值 25%），草稿模型的 K 步提案和追赶也跟着 eager；pad 保住了 graph，但每条序列照样算 1+k_max 行、草稿模型照样跑 k_max 步，省下的只是被砍掉的那几位的验证结果——pad 模式下"按序列砍 k"和"整个 batch 用 k_max"算的一样多，只是少接受几个 token（batch 8 上平均每步 3.1 个草稿对 3.8 个，×0.93 的账和实测 ×0.90 对得上），必然不如 batch 级。
+   更根本的是上限本来就小：batch 32 上固定 k=4 ×1.14、batch 级开关 ×1.12，说明混合负载里 chat 一半"白算"的位置只花了两个点——decode 在这个 batch 下仍是读权重为主，多几行接近免费；按序列 k 能省的最多就是这两个点，而 ragged 步的代价远不止。预期那一节没把这笔账算清楚。要赢需要两件事一起成立：ragged 注意力进 CUDA graph（按总行数分桶，输入 pad 到桶），草稿模型只给需要的序列跑需要的步数而不是 batch 的 k_max；而且只在 target 算力受限、行不再免费的 batch 下才有赚头。两项都没做，模式留着（默认关），数据留在这里。
+
+- GPU 测试 42/44（8 个跳过），和 233732 一样挂在 n-gram 两种按序列模式的混合 batch 用例（`num_ragged_steps == 0`，输出和参考一致），说明 cc2a84a 的先验不是它的原因；原因见做法一节（测试的 prompt 开着思考模式，抄写任务没开始抄），用例已改，下一次 GPU 作业验证。
+- 重编译 345 次，比 233732 的 292 次多的是 pad 行的预热；都在计时之前。
 
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。
 - ngram 版和异步调度合并：要把 ngram 查找搬到 GPU 上（vLLM 的做法是 CPU 上查、但等上一步落地，等于放弃了异步）。草稿模型版已经合并（见上）。
-- k 自适应：按 batch 大小关草稿已做并复测（batch 32 关草稿时 edit ×0.98、chat ×1.00）；按每个草稿位的接受率调 k 已做并同场复测（草稿模型上 edit batch 1 ×3.2、chat batch 32 ×1.19，固定 k=4 只有 ×1.04；n-gram 在 chat batch 32 上从 ×0.74 回到 ×0.99，差距查清是三条 `torch.compile` 守卫，见上）。每条序列一个 k（混合负载需要）已做（见上）：第一次 A40 作业抓到两个 bug 并发现 eager 的 ragged 步在 batch 8 上亏 11%，于是加了补空行、保住 CUDA graph 的 `speculative_ragged="pad"` 模式；两种模式的 GPU 对比在排。还没做的是把 batch 大小的阈值按 target 何时算力受限来定（这台 A40 上 8B + 0.6B 用 8 太低），让 K 本身跟着负载走，以及按行数在 varlen 和 pad 之间自动选。
+- k 自适应：按 batch 大小关草稿已做并复测（batch 32 关草稿时 edit ×0.98、chat ×1.00）；按每个草稿位的接受率调 k 已做并同场复测（草稿模型上 edit batch 1 ×3.2、chat batch 32 ×1.19，固定 k=4 只有 ×1.04；n-gram 在 chat batch 32 上从 ×0.74 回到 ×0.99，差距查清是三条 `torch.compile` 守卫，见上）。每条序列一个 k（混合负载需要）已做并在 A40 上量完（见上）：机制对、接受率涨，但哪一格都没赢过 batch 级开关——varlen 丢 CUDA graph，pad 算的行和草稿步数与 batch 用 k_max 一样多，而混合负载里"白算"的位置在读权重为主的 decode 下本来只值两个点；要赢得把 ragged 注意力放进 CUDA graph（按总行数分桶）并让草稿模型只给需要的序列跑需要的步数，还没做。还没做的还有把 batch 大小的阈值按 target 何时算力受限来定（这台 A40 上 8B + 0.6B 用 8 太低），让 K 本身跟着负载走，以及按行数在 varlen 和 pad 之间自动选。
 - 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：温度采样下接受率更高，要多存 `(B, k, V)` 的 q。
 - EAGLE-3 草稿头（可选）。
 - ngram 索引在 CPU 上：长 prompt 第一次 decode 要建索引，每个 token 4 次字典写入。
@@ -478,6 +496,6 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 ## 面试时可以讲的取舍
 
 - 为什么 one-hot 提议下拒绝采样是精确的：接受概率 `min(1, p/q)` 在 q 是 one-hot 时就是 `p(d)`；残差 `max(0, p-q)` 就是把 d 的概率置零。任何只依赖上下文的确定性猜法都满足这个条件。
-- 为什么 batch 里所有序列都是 k+1 个 query：形状统一才能用 `flash_attn_with_kvcache` 和 CUDA graph。代价是没猜中的序列也算 k+1 个位置；vLLM 用 varlen 注意力支持每条序列草稿数不同。后来加的 `speculative_per_sequence` 就是这条路：只有草稿数不同的步才走 varlen 和 eager，其余步形状照旧。
+- 为什么 batch 里所有序列都是 k+1 个 query：形状统一才能用 `flash_attn_with_kvcache` 和 CUDA graph。代价是没猜中的序列也算 k+1 个位置；vLLM 用 varlen 注意力支持每条序列草稿数不同。后来加的 `speculative_per_sequence` 就是这条路，A40 上量完的结论是在这个组合上不值：读权重为主的 decode 里多几行接近免费，砍掉 chat 一半的位置最多省两个点，而 ragged 步要么丢 CUDA graph（batch 8 上值 25%）要么（补空行）算得和不砍一样多。能说清"为什么没赢、上限是多少、要赢还缺什么"比一个赢了的数字更有用。
 - 为什么不回收多分配的块：下一步写的位置从 `L+a` 开始，到 `L+a+k` 结束，需要的块数不会少于这一步，回收了马上又要分配。
 - 什么时候有用：decode 受内存带宽限制（小 batch、大模型）而且输出复述输入的时候。随机文本或大 batch 下会变慢，这是 benchmark 里要老实展示的。

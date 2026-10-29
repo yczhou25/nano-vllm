@@ -18,7 +18,7 @@ class Config:
     speculative_disable_by_batch_size: int | None = None    # decode without drafts while more sequences than this are running
     speculative_min_acceptance: float | None = None    # decode without drafts while the measured draft acceptance rate is below this
     speculative_per_sequence: bool = False    # with speculative_min_acceptance: a number of drafts per sequence, from its own acceptance rates
-    speculative_ragged: str = "varlen"    # how a batch with different numbers of drafts runs: "varlen" (a row per token, varlen attention, no CUDA graph) or "pad" (every sequence padded to the most drafts, fixed-width attention and CUDA graphs)
+    speculative_ragged: str = "pad"    # how a batch with different numbers of drafts runs: "pad" (every sequence padded to the most drafts, fixed-width attention and CUDA graphs; faster except on a mixed batch of 32) or "varlen" (a row per token, varlen attention, no CUDA graph)
     hf_config: AutoConfig | None = None
     draft_hf_config: AutoConfig | None = None
     eos: int = -1

@@ -57,7 +57,7 @@ def main():
     parser.add_argument("--speculative-min-acceptance", type=float, default=None, help="propose only the leading draft positions whose measured acceptance rate reaches this (down to none)")
     parser.add_argument("--probe-interval", type=int, default=None, help="with --speculative-min-acceptance: decode steps between two full-K probes (default Scheduler.PROBE_INTERVAL)")
     parser.add_argument("--speculative-per-sequence", action="store_true", help="with --speculative-min-acceptance: a number of drafts per sequence, from its own acceptance rates")
-    parser.add_argument("--speculative-ragged", choices=["varlen", "pad"], default="varlen", help="how a batch with different numbers of drafts runs: varlen attention without CUDA graphs, or padded to the most drafts with the fixed-width kernel and the graphs")
+    parser.add_argument("--speculative-ragged", choices=["varlen", "pad"], default="pad", help="how a batch with different numbers of drafts runs: varlen attention without CUDA graphs, or padded to the most drafts with the fixed-width kernel and the graphs")
     args = parser.parse_args()
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,
