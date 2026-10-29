@@ -1,0 +1,24 @@
+# Job 233573, 2026-10-29, 1x A40 (250 W, 1740 MHz), code 5b62af5 (per-sequence k, first GPU check), 49 min.
+# Qwen3-8B target, Qwen3-0.6B draft model, bf16, max_model_len 4096, TORCH_LOGS=recompiles.
+# 16 of 18 rows: the two draft-model rows with --speculative-per-sequence (mixed b32 and chat b32) crashed
+# in the ragged draft path ("seqlens_k must have dtype int32": the per-sequence context lengths of the
+# draft model's steps were computed in int64; fixed in the next commit). GPU tests: 28 of 33 passed; the
+# same dtype error failed draft_per_sequence's sampling test and left the three async_draft_per_sequence
+# tests without KV-cache memory at setup; spec_per_sequence's greedy test asserted ragged steps that four
+# short questions did not produce (the test now uses a mixed batch). Rows verbatim from bench_spec.py.
+workload=mixed drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 batch=32 T=0.0 tokens=28352 time=39.37s throughput=720.2tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+workload=mixed drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 batch=32 T=0.0 tokens=28350 time=40.93s throughput=692.6tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+workload=mixed drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=0 batch=32 T=0.0 tokens=28312 time=41.90s throughput=675.6tok/s acceptance=0.272 acc_pos=0.31,0.27,0.25,0.24 k_steps=549,142,48,29,239 ragged=0.00 capped=0.00
+workload=mixed drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=1 batch=32 T=0.0 tokens=28398 time=41.80s throughput=679.4tok/s acceptance=0.437 acc_pos=0.49,0.44,0.41,0.38 k_steps=14536,694,448,382,4044 ragged=0.48 capped=0.00
+workload=mixed drafter=model k=4 async=0 disable_by=None min_acc=None probe=16 per_seq=0 batch=32 T=0.0 tokens=28192 time=33.10s throughput=851.6tok/s acceptance=0.564 acc_pos=0.74,0.59,0.49,0.43 k_steps=0,0,0,0,430 ragged=0.00 capped=0.00
+workload=mixed drafter=model k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=0 batch=32 T=0.0 tokens=28172 time=33.56s throughput=839.5tok/s acceptance=0.570 acc_pos=0.74,0.59,0.49,0.43 k_steps=0,0,0,112,340 ragged=0.00 capped=0.00
+workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 batch=32 T=0.0 tokens=31064 time=35.28s throughput=880.5tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+workload=chat drafter=ngram k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=1 batch=32 T=0.0 tokens=31088 time=37.16s throughput=836.5tok/s acceptance=0.106 acc_pos=0.18,0.10,0.06,0.04 k_steps=27264,688,280,72,1800 ragged=0.21 capped=0.00
+workload=chat drafter=model k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=0 batch=32 T=0.0 tokens=31272 time=29.55s throughput=1058.3tok/s acceptance=0.476 acc_pos=0.65,0.45,0.31,0.20 k_steps=0,0,123,342,44 ragged=0.00 capped=0.00
+workload=edit drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 batch=32 T=0.0 tokens=24793 time=42.02s throughput=590.0tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+workload=edit drafter=model k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=0 batch=32 T=0.0 tokens=24786 time=27.30s throughput=908.1tok/s acceptance=0.856 acc_pos=0.92,0.87,0.83,0.80 k_steps=0,0,0,0,255 ragged=0.00 capped=0.00
+workload=edit drafter=model k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=1 batch=32 T=0.0 tokens=24785 time=27.42s throughput=904.0tok/s acceptance=0.855 acc_pos=0.92,0.86,0.83,0.81 k_steps=0,0,16,0,5610 ragged=0.06 capped=0.00
+workload=mixed drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 batch=8 T=0.0 tokens=7093 time=32.62s throughput=217.4tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+workload=mixed drafter=model k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=0 batch=8 T=0.0 tokens=7079 time=22.82s throughput=310.2tok/s acceptance=0.578 acc_pos=0.75,0.60,0.50,0.44 k_steps=0,0,0,80,358 ragged=0.00 capped=0.00
+workload=mixed drafter=model k=4 async=0 disable_by=None min_acc=0.2 probe=16 per_seq=1 batch=8 T=0.0 tokens=7085 time=25.74s throughput=275.3tok/s acceptance=0.635 acc_pos=0.74,0.61,0.55,0.60 k_steps=32,99,386,632,1182 ragged=0.80 capped=0.00
+workload=mixed drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 batch=32 T=0.0 tokens=28352 time=39.39s throughput=719.7tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00

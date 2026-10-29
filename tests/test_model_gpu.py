@@ -97,8 +97,6 @@ def test_greedy_matches_reference(llm, reference):
     for prompt, completion in zip(prompts, generate(llm, prompts)):
         assert completion
         check(reference, prompt, completion)
-    if scheduler.speculative_per_sequence and not scheduler.has_draft_model:
-        assert scheduler.num_ragged_steps, "the questions' n-gram drafts should be cut at different positions"
     if scheduler.has_draft_model and scheduler.num_draft_tokens and os.path.samefile(DRAFT_MODEL, MODEL):
         # The target drafting for itself: every draft matches the greedy token unless bf16 noise
         # between the draft and verification passes flips a near-tie.
@@ -115,6 +113,27 @@ def test_chunked_prefill_and_prefix_cache_match_reference(llm, reference):
     for prompt, a, b in zip(prompts, first, second):
         check(reference, prompt, a)
         check(reference, prompt, b)
+
+
+COPY_TEXT = " ".join(f"Sentence {i}: the scheduler batches requests, the block manager hands out KV cache blocks, "
+                     f"and the model runner turns them into input tensors." for i in range(3))
+
+
+def test_ragged_batch_matches_reference(llm, reference):
+    # speculative_per_sequence: a copying task keeps its n-gram drafts (the text is in its prompt)
+    # while the questions lose theirs, so the batch decodes with different numbers of drafts per
+    # sequence (ragged steps: varlen attention, no CUDA graph, the sampler's ragged branch). With
+    # the target drafting for itself, only a near-tie flipped by bf16 noise cuts a sequence.
+    scheduler = llm.scheduler
+    if not scheduler.speculative_per_sequence:
+        pytest.skip("per-sequence k only")
+    prompts = [chat(llm.tokenizer, f"Repeat the following text exactly, word for word:\n\n{COPY_TEXT}")] + [chat(llm.tokenizer, q) for q in QUESTIONS]
+    scheduler.reset_stats()
+    for prompt, completion in zip(prompts, generate(llm, prompts)):
+        assert completion
+        check(reference, prompt, completion)
+    if not scheduler.has_draft_model:
+        assert scheduler.num_ragged_steps, "the copying task keeps its n-gram drafts while the questions lose theirs"
 
 
 def test_sampling_returns_max_tokens(llm):

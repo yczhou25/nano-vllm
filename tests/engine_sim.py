@@ -118,6 +118,10 @@ def reference(prompt, sp: SamplingParams):
 def prepare(runner, seqs, is_prefill):
     input_ids, positions = runner.prepare_prefill(seqs) if is_prefill else runner.prepare_decode(seqs)
     c = get_context()
+    for name in ("slot_mapping", "context_lens", "cu_seqlens_q", "cu_seqlens_k"):    # the attention kernels want int32
+        t = getattr(c, name)
+        if t is not None and t.dtype != torch.int32:
+            raise Violation(f"{name} has dtype {t.dtype}, not int32")
     meta = dict(
         input_ids=input_ids.tolist(),
         positions=positions.tolist(),
@@ -129,6 +133,7 @@ def prepare(runner, seqs, is_prefill):
         context_lens=c.context_lens.tolist() if c.context_lens is not None else None,
         block_tables=c.block_tables.tolist() if c.block_tables is not None else None,
         draft_inputs=[t.tolist() for t in runner.draft_inputs] if not is_prefill and runner.draft_inputs is not None else None,
+        draft_dtypes=[t.dtype for t in runner.draft_inputs] if not is_prefill and runner.draft_inputs is not None else None,
         draft_layout=[t.tolist() if t is not None else None for t in runner.draft_layout] if not is_prefill and runner.draft_layout is not None else None,
         sampler_layout=[t.tolist() for t in runner.sampler_layout] if not is_prefill and runner.sampler_layout is not None else None,
     )
@@ -169,6 +174,8 @@ class FakeDraftModel:
         c = get_context()
         if c.is_prefill:
             raise Violation("the draft model was called for prefill through propose")
+        if c.slot_mapping.dtype != torch.int32 or c.context_lens.dtype != torch.int32:
+            raise Violation(f"draft step slot_mapping {c.slot_mapping.dtype} context_lens {c.context_lens.dtype}, not int32")
         ids, pos, slots = input_ids.tolist(), positions.tolist(), c.slot_mapping.tolist()
         context_lens, block_tables = c.context_lens.tolist(), c.block_tables.tolist()
         q = len(ids) // len(self.seqs)
@@ -245,7 +252,6 @@ class FakeModel:
         self.num_speculative_tokens = num_speculative_tokens
         self.mixed_draft_quality = False    # see draft_miss_mod
         self.steps_without_probe = 0        # consecutive decode steps with fewer than K drafts (adaptive k)
-        self.steps_without_probe_by_seq = collections.Counter()    # the same per sequence (speculative_per_sequence)
         self.num_capped_steps = 0           # the scheduler's count of steps with drafts off by batch size, as of the last decode step
         self.rejection_sampler = RejectionSampler()
         self.last_outputs = {}
@@ -342,7 +348,7 @@ class FakeModel:
         set_context(False, slot_mapping=torch.tensor(meta["slot_mapping"], dtype=torch.int32),
                     context_lens=torch.tensor(meta["context_lens"], dtype=torch.int32),
                     block_tables=torch.tensor(meta["block_tables"], dtype=torch.int32))
-        self.runner.draft_inputs = tuple(torch.tensor(t) for t in meta["draft_inputs"])
+        self.runner.draft_inputs = tuple(torch.tensor(t, dtype=dtype) for t, dtype in zip(meta["draft_inputs"], meta["draft_dtypes"]))
         self.runner.draft_layout = tuple(torch.tensor(t) if t is not None else None for t in meta["draft_layout"])
         ids = self.runner.propose(torch.tensor(meta["input_ids"], dtype=torch.int64), torch.tensor(meta["positions"], dtype=torch.int64)).tolist()
         c = get_context()
@@ -378,19 +384,23 @@ class FakeModel:
             # it so, as the number of running sequences it saw may have shrunk by preemption since.
             if q != 1 or len(scheduler.running) + len(scheduler.waiting) <= scheduler.speculative_disable_by_batch_size:
                 raise Violation(f"decode step with {qs} tokens per sequence counted as capped with {len(scheduler.running)} running, {len(scheduler.waiting)} waiting")
+            self.steps_without_probe += 1    # a capped step counts towards the batch's probe
         elif per_sequence:
             # Each sequence proposes the leading positions its own rates admit, and every position on
-            # its first step and every PROBE_INTERVAL-th step of its own (counted here independently).
+            # its first step; the probe is the batch's (counted here independently): after
+            # PROBE_INTERVAL steps in which some sequence proposed fewer than K, every sequence
+            # proposes K, in one uniform step.
+            probe = self.steps_without_probe >= scheduler.PROBE_INTERVAL
             for seq, seq_q in zip(seqs, qs):
                 expected = 0
                 while expected < K and seq.acceptance[expected + 1] >= scheduler.speculative_min_acceptance:
                     expected += 1
-                if self.steps_without_probe_by_seq[seq.seq_id] >= scheduler.PROBE_INTERVAL:
+                if probe:
                     expected = K
                 if seq_q - 1 != expected:
                     raise Violation(f"seq {seq.seq_id}: {seq_q - 1} drafts, expected {expected} at acceptance {[round(a, 3) for a in seq.acceptance[1:]]} "
-                                    f"after {self.steps_without_probe_by_seq[seq.seq_id]} steps without a probe")
-                self.steps_without_probe_by_seq[seq.seq_id] = 0 if seq_q - 1 == K else self.steps_without_probe_by_seq[seq.seq_id] + 1
+                                    f"after {self.steps_without_probe} steps without a probe")
+            self.steps_without_probe = 0 if all(seq_q - 1 == K for seq_q in qs) else self.steps_without_probe + 1
         elif scheduler.speculative_min_acceptance is not None and scheduler.speculative_disable_by_batch_size is None:
             # Adaptive k alone decides: a step proposes the leading draft positions whose measured
             # acceptance rate reaches the threshold (computed here independently of the scheduler),

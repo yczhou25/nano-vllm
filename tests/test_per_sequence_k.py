@@ -75,14 +75,14 @@ def test_a_new_sequence_starts_with_every_position():
     assert decode(scheduler, [0, 4]) == [0, K]
 
 
-def test_each_sequence_probes_on_its_own_schedule():
+def test_probes_are_the_batchs_one_uniform_step():
+    # The probe counter is the batch's: it counts the steps in which some sequence proposed fewer
+    # than K, and the probe gives every sequence K in the same step (a uniform step, which keeps the
+    # CUDA graphs), rather than each sequence probing at its own time in a ragged step.
     scheduler = make_scheduler(2, probe=3)
-    assert decode(scheduler, [0, 0]) == [K, K]
-    assert [decode(scheduler, [0, 0]) for _ in range(7)] == [[0, 0], [0, 0], [0, 0], [K, K], [0, 0], [0, 0], [0, 0]]
-    a, b = scheduler.running
-    b.num_steps_without_probe = 2    # a sequence's probes do not wait for the others'
-    assert [decode(scheduler, [0, 0]) for _ in range(3)] == [[K, 0], [0, K], [0, 0]]
-    assert scheduler.num_steps_by_k == [16, 0, 0, 0, 6]    # sequence-steps in this mode
+    assert decode(scheduler, [0, 4]) == [K, K]
+    assert [decode(scheduler, [0, 4]) for _ in range(7)] == [[0, K], [0, K], [0, K], [K, K], [0, K], [0, K], [0, K]]
+    assert scheduler.num_steps_by_k == [6, 0, 0, 0, 10]    # sequence-steps in this mode
 
 
 def test_a_shorter_step_counts_towards_the_probe_and_leaves_later_positions_alone():
@@ -113,7 +113,8 @@ def test_batch_size_rule_still_applies_to_every_sequence():
     assert [decode(scheduler, [4, 4]) for _ in range(3)] == [[0, 0]] * 3
     assert scheduler.num_capped_steps == 3 and scheduler.num_ragged_steps == 0
     for seq in scheduler.running:
-        assert rates(seq) == [1.0] * K and seq.num_steps_without_probe == 0    # not counted as its steps without a probe
+        assert rates(seq) == [1.0] * K    # nothing proposed, nothing measured
+    assert scheduler.num_steps_without_probe == 3    # capped steps count towards the probe, as in the batch-wide mode
 
 
 def test_statistics_count_sequence_steps_and_positions():

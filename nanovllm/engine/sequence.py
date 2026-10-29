@@ -32,7 +32,6 @@ class Sequence:
         # decode steps since it last proposed every position (Scheduler with speculative_per_sequence).
         self.acceptance = None
         self.num_acceptance_samples = None
-        self.num_steps_without_probe = 0
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature

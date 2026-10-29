@@ -15,8 +15,9 @@ class Scheduler:
     # workload changes.
     # With speculative_per_sequence every sequence keeps its own rates (one sample per position
     # per step) and gets its own number of drafts, so a batch can hold sequences with different
-    # numbers of drafts (a ragged batch, see ModelRunner.prepare_decode); it probes on its first
-    # step and every PROBE_INTERVAL steps of its own.
+    # numbers of drafts (a ragged batch, see ModelRunner.prepare_decode); a sequence proposes every
+    # position on its first step, and the probes stay the batch's, so that a probe is one uniform
+    # step rather than a ragged step per sequence.
     ACCEPTANCE_WINDOW = 64    # sequence-steps per position, or ACCEPTANCE_MIN_STEPS steps if that is more
     ACCEPTANCE_MIN_STEPS = 8  # a large batch fills 64 samples in two steps, too few to decide on
     ACCEPTANCE_WINDOW_PER_SEQUENCE = 16    # steps of one sequence: small, so a sequence that stops copying its prompt is noticed within a few steps
@@ -91,7 +92,8 @@ class Scheduler:
         if capped:
             k = 0    # a batch this large keeps the GPU busy by itself; the k extra positions would not be free
         per_sequence = k > 0 and self.speculative_per_sequence    # each sequence picks its own number of drafts below
-        if k and self.speculative_min_acceptance is not None and not per_sequence and self.num_steps_without_probe < self.PROBE_INTERVAL:
+        probe = self.num_steps_without_probe >= self.PROBE_INTERVAL    # every sequence proposes all K positions, to measure the left-out ones again
+        if k and self.speculative_min_acceptance is not None and not per_sequence and not probe:
             k = self.num_acceptable_drafts()    # positions rejected too often are left out; the next probe step measures them again
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -99,7 +101,7 @@ class Scheduler:
             if seq.num_completion_tokens + seq.num_inflight >= seq.max_tokens:    # the step in flight may finish it
                 kept_seqs.append(seq)
                 continue
-            num_drafts = self.num_acceptable_drafts(seq) if per_sequence else k
+            num_drafts = (self.num_speculative_tokens if probe else self.num_acceptable_drafts(seq)) if per_sequence else k
             num_decode_tokens = 1 + num_drafts
             while not self.block_manager.can_append(seq, num_decode_tokens):
                 if self.running:
@@ -116,7 +118,6 @@ class Scheduler:
                 scheduled_seqs.append(seq)
                 kept_seqs.append(seq)
                 if per_sequence:
-                    seq.num_steps_without_probe = 0 if num_drafts == self.num_speculative_tokens else seq.num_steps_without_probe + 1
                     self.num_steps_by_k[num_drafts] += 1    # sequence-steps in this mode
         self.running.extendleft(reversed(kept_seqs))
         if scheduled_seqs:
@@ -124,6 +125,7 @@ class Scheduler:
             self.num_capped_steps += bool(capped)
             if per_sequence:
                 self.num_ragged_steps += len({seq.num_scheduled_tokens for seq in scheduled_seqs}) > 1
+                self.num_steps_without_probe = 0 if all(seq.num_scheduled_tokens == 1 + self.num_speculative_tokens for seq in scheduled_seqs) else self.num_steps_without_probe + 1
             else:
                 self.num_steps_without_probe = 0 if k == self.num_speculative_tokens else self.num_steps_without_probe + 1
                 self.num_steps_by_k[k] += 1
@@ -142,13 +144,9 @@ class Scheduler:
 
     def num_acceptable_drafts(self, seq: Sequence | None = None) -> int:
         """The leading draft positions whose measured acceptance rate reaches the threshold: the
-        batch's rates, or with a sequence its own, which proposes every position on its first step
-        (nothing measured yet) and on every PROBE_INTERVAL-th step of its own."""
-        acceptance = self.acceptance
-        if seq is not None:
-            if seq.num_steps_without_probe >= self.PROBE_INTERVAL:
-                return self.num_speculative_tokens
-            acceptance = seq.acceptance
+        batch's rates, or with a sequence its own, which admit every position on its first step
+        (nothing measured yet). The probe steps are decided by the caller."""
+        acceptance = self.acceptance if seq is None else seq.acceptance
         k = 0
         while k < self.num_speculative_tokens and acceptance[k + 1] >= self.speculative_min_acceptance:
             k += 1

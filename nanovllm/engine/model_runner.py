@@ -461,6 +461,8 @@ class ModelRunner:
         context_lens, block_tables = context.context_lens, context.block_tables
         tokens, catchup_positions, catchup_slots = self.draft_inputs
         token_index, write_index, num_drafts = self.draft_layout    # num_drafts: None unless the batch is ragged
+        if num_drafts is not None:
+            num_drafts = num_drafts.to(torch.int32)    # the attention kernel wants int32 context lengths
         bs, m = tokens.shape
         k = token_index.size(1) - 1
         slot_mapping = context.slot_mapping
@@ -476,7 +478,7 @@ class ModelRunner:
                     # A sequence with fewer drafts scores a dummy row (its last one again, its KV
                     # masked) at its own context length, and its proposal goes to the scratch row.
                     step_slots = torch.where(num_drafts > i, step_slots, -1)
-                    step_context_lens = context_lens - num_drafts + torch.minimum(num_drafts, torch.tensor(i, device=num_drafts.device))
+                    step_context_lens = context_lens - num_drafts + torch.minimum(num_drafts, torch.tensor(i, dtype=torch.int32, device=num_drafts.device))
             set_context(False, slot_mapping=step_slots.reshape(-1), context_lens=step_context_lens, block_tables=block_tables)
             # Graphs exist for 1 and 2 tokens per sequence; a longer catch-up, after steps without drafts, runs eagerly.
             graphs, outputs = (self.draft_graphs.get(q), self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
