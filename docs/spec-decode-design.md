@@ -441,13 +441,25 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 - 回归正常：edit batch 32 草稿模型开关按序列 904.0 对 batch 级 908.1（ragged 步 6%，差 0.5%）；两次混合基线 720.2 / 719.7。
 - GPU 测试里 `spec_per_sequence` 的贪心用例断言“必须出现 ragged 步”，四个短问题的 n-gram 草稿全被砍到 0，没出现；换成上面说的混合 batch 用例。
 
-第二次作业（`cluster/nanovllm-perseq2-a40.sbatch`，同样的行加 batch 8 的 eager 基线）在排。
+### 复测（作业 233732，2026-10-29，代码 b1d90de，ragged 模式 varlen，43 分钟）
+
+脚本 `cluster/nanovllm-perseq2-a40.sbatch`（和第一次一样的行，加 batch 8 的 eager 基线），跑在一台 300 W 的 A40 节点上（基线比 233573 的 250 W 节点高，只在作业内比）。原始行在 `docs/benchmarks/qwen3-8b-a40-perseq.txt`。两处 bug 修了之后，数字把结论说清楚了：**eager 的 ragged 步把按序列的收益全吃掉了**。
+
+- 混合负载 batch 32：基线 846.2；n-gram 开关 batch 级 784.5（×0.93）、按序列 741.9（×0.88，57% 的步是 ragged 步，接受率 0.27 → 0.44）；草稿模型固定 k=4 961.3（×1.14）、开关 batch 级 943.6（×1.12）、按序列 777.5（×0.92，78% ragged，接受率 0.57 → 0.64）。接受率涨了，吞吐反而掉：ragged 步里 target 和草稿模型的 K 次提案、追赶步全走 eager，草稿模型 28 层的小 kernel 没了 CUDA graph 比 target 亏得多（batch 32 上 target 单独 eager 只亏 4%）。
+- 混合负载 batch 8：基线 252.3，eager 基线 190.4——**CUDA graph 在 batch 8 上值 25%**（batch 32 上 4%）；草稿模型开关 batch 级 349.1（×1.38）、按序列 282.7（×1.12，73% ragged）。
+- chat batch 32：基线 1044.0；n-gram 按序列 952.2（×0.91，21% ragged：探测已经同步，这 21% 是第 1 位接受率留在 0.2 之上的序列跑 k=1、其他跑 0，是真的参差）；草稿模型按序列 948.2（×0.91，72% ragged）。
+- edit batch 32 回归正常：草稿模型开关 batch 级 1008.7（×1.46）、按序列 1005.2（×1.46，6% ragged）。两次混合基线 846.2 / 845.1。
+- 两行没出数（混合 batch 32 的 eager 基线、chat batch 32 草稿模型开关 batch 级）：进程一行都没打就退了，日志里没有 traceback 也没有 Killed。第三次作业的脚本记每一行的退出码，没出结果行的重跑一次。
+- 重编译查过了：日志里 292 次 `Recompiling` 全在计时之前（基线一行 12 次、固定 k=4 17 次、开关 21 次、按序列 23 次，多的两次是 ragged 采样分支 k=1 和 k≥2 的预热；每一行最后一次重编译都是 bench 计时前那条 63 个 token 的预热 prefill）。在 CPU 上也验了一遍：预热之后，varlen 和 pad 两种布局、各种 batch 和草稿数的 ragged 步都不再编译。
+- GPU 测试 42/44（8 个跳过）：挂的是 n-gram 两种按序列模式的混合 batch 用例，输出和参考一致，但 `num_ragged_steps == 0`。原因在上面做法里说了（一个样本就把抄写任务的接受率打到 0，16 步没草稿，问题先答完了），已在 cc2a84a 加一个先验样本修掉。
+
+结论：varlen 模式下按序列的 k 不能做默认。它该赢的地方（接受率）赢了，输在每个 ragged 步都是 eager；要么 pad 模式把 graph 保住（第三次作业 234187，varlen 对 pad，同一场跑），要么按序列只在 batch 很小、行几乎免费的时候开。
 
 ### ragged 步的第二种跑法：补空行、保住 CUDA graph（2026-10-29 加）
 
 `LLM(..., speculative_ragged="pad")`（默认 `"varlen"`）。上面 batch 8 的教训是 ragged 步不能 eager。原来想的是按总行数分桶给 varlen kernel 抓 CUDA graph，但有个更省事的做法，就是草稿模型追赶步已经在用的那一招：**所有序列都算 k_max+1 行，草稿少的序列在前面补空行，自己的行靠右对齐**。`flash_attn_with_kvcache` 的因果掩码按右下角对齐（最后一个 query 对准 `cache_seqlens-1`），所以序列 i 的真实行 j 正好看到 `L_i-1+j` 之前的 key，和它单独算一模一样；前面的空行看到的 key 更少，输出是垃圾，但 slot 置 -1 不写 KV、位置夹到 0，采样器按 `token_index` 只取真实行。于是 ragged 步和统一形状的步走同一条路：同一个 kernel、同一套按 q 抓的 CUDA graph、同一个采样器分支（`token_index` 换成 padded 布局），`propose` 一行不改（草稿少的序列的多余提案写进它自己的空行）。
 
-代价是多算的空行：batch 32 混合负载里 16 条 k=4、16 条 k=0 的步，varlen 算 96 行，pad 算 160 行；n-gram 在 chat batch 32 上 k=4（160 行、全拒）比不投机慢 35%（作业 225010），所以 batch 大时空行不是免费的，而 varlen 的 eager 只亏 4%。batch 8 时反过来：行几乎免费，eager 亏 11%。两种模式都留着，第三次作业在 batch 8 和 32 上各测一遍再定默认值（或者按行数自动选）。
+代价是多算的空行：batch 32 混合负载里 16 条 k=4、16 条 k=0 的步，varlen 算 96 行，pad 算 160 行；n-gram 在 chat batch 32 上 k=4（160 行、全拒）比不投机慢 35%（作业 225010），所以 batch 大时空行不是免费的，而 varlen 的 eager 只亏 4%。batch 8 时反过来：行几乎免费，eager 亏 11%。两种模式都留着，第三次作业（234187）在 batch 8 和 32 上各测一遍再定默认值（或者按行数自动选）。作业 233732 之后更清楚了：batch 8 上 graph 值 25%，草稿模型的提案步比 target 更怕 eager，所以 pad 模式要保住的不只是 target 那 4%。
 
 - `ModelRunner.ragged_layout(num_drafts, pad=True)`：每条序列 `1+k` 行，`token_index` 指向靠右的真实行，`write_index` 里没有的草稿指向本序列的空行（不再需要 scratch 行）。
 - n-gram 路径：按序列先放 `k - k_i` 个空行（token 0、位置 0、slot -1）再放真实行；context 和统一步一样。草稿模型路径：位置 `L-1+c-front` 夹到 0，slot 按 `c >= front` 屏蔽，最后一个 token 放到第 `front` 列；追赶步不变。
