@@ -10,6 +10,17 @@ from nanovllm.layers.sampler import RejectionSampler, accepted_token_ids
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def test_padded_ragged_layout():
+    # Every sequence gets 1 + max drafts rows; its own are the last ones, behind dummy rows, and
+    # the drafts it does not have are written to its dummy rows.
+    token_index, write_index, num_drafts = ModelRunner.ragged_layout([2, 0, 1], pad=True)
+    assert token_index.tolist() == [[0, 1, 2], [5, 5, 5], [7, 8, 8]]
+    assert write_index.tolist() == [[1, 2], [3, 4], [8, 6]]
+    assert num_drafts.tolist() == [2, 0, 1]
+    token_index, write_index, _ = ModelRunner.ragged_layout([2, 2], pad=True)    # uniform: the plain grid
+    assert token_index.tolist() == [[0, 1, 2], [3, 4, 5]] and write_index.tolist() == [[1, 2], [4, 5]]
+
+
 def test_ragged_layout():
     token_index, write_index, num_drafts = ModelRunner.ragged_layout([2, 0, 1])
     assert token_index.tolist() == [[0, 1, 2], [3, 3, 3], [4, 5, 5]]    # padded by repeating the last row

@@ -42,6 +42,7 @@ class ModelRunner:
         self.last_token_ids = None    # last run_async step's sampled tokens, still on the GPU (see AsyncOutput)
         self.draft_model = None
         self.draft_inputs = None      # the draft model's decode inputs, prepared with the target's
+        self.ragged_mode = config.speculative_ragged    # how a ragged batch runs: "varlen" or "pad" (see prepare_decode)
         self.draft_layout = None      # where each sequence's drafts go in the decode inputs (see ragged_layout)
         self.sampler_layout = None    # the same for RejectionSampler, in a ragged batch only
         self.graphs = None            # CUDA graphs by decode batch size, once captured (see capture_cudagraph)
@@ -266,21 +267,24 @@ class ModelRunner:
         return input_ids, positions
 
     @staticmethod
-    def ragged_layout(num_drafts: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def ragged_layout(num_drafts: list[int], pad: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Where each sequence's rows are in a decode step's inputs, which hold every sequence's
-        input token and then its drafts, one row each: sequence i has 1 + num_drafts[i] rows. Returns
-        token_index (batch_size, 1 + max drafts), the row of each sequence's input token and drafts,
-        padded by repeating its last row; write_index (batch_size, max drafts), the rows its drafts
-        are written to, with the scratch row after the last one for the drafts it does not have;
-        and num_drafts (batch_size,). A batch whose sequences all have the same number of drafts
-        is a (batch_size, 1 + k) grid, and the samplers take it as such."""
+        input token and then its drafts, one row each. Without pad ("varlen"), sequence i has
+        1 + num_drafts[i] rows and a scratch row follows the last sequence; with pad, every sequence
+        has 1 + max(num_drafts) rows, its own right-aligned behind k - num_drafts[i] dummy rows.
+        Returns token_index (batch_size, 1 + max drafts), the row of each sequence's input token
+        and drafts, padded by repeating its last row; write_index (batch_size, max drafts), the rows
+        its drafts are written to, with the scratch row (or one of its dummy rows) for the drafts it
+        does not have; and num_drafts (batch_size,). A batch whose sequences all have the same
+        number of drafts is a (batch_size, 1 + k) grid either way, and the samplers take it as such."""
         k = max(num_drafts)
         n = sum(num_drafts) + len(num_drafts)
         token_index, write_index, row = [], [], 0
         for num in num_drafts:
-            token_index.append([row + min(j, num) for j in range(k + 1)])
-            write_index.append([row + j if j <= num else n for j in range(1, k + 1)])
-            row += 1 + num
+            front = k - num if pad else 0
+            token_index.append([row + front + min(j, num) for j in range(k + 1)])
+            write_index.append([row + front + j if j <= num else (row + j - num - 1 if pad else n) for j in range(1, k + 1)])
+            row += 1 + (k if pad else num)
         return torch.tensor(token_index, dtype=torch.int64), torch.tensor(write_index, dtype=torch.int64), torch.tensor(num_drafts, dtype=torch.int64)
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -293,10 +297,20 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         cu_seqlens_q = [0]
+        num_drafts = [len(seq.draft_token_ids) for seq in seqs]
+        ragged = len(set(num_drafts)) > 1    # speculative_per_sequence: sequences with different numbers of drafts
+        pad = ragged and self.ragged_mode == "pad"
         for seq in seqs:
             # With async scheduling the newest token may still be on the GPU, in the last step's output.
             # With speculative decoding the draft tokens follow it, and all of them are scored at once.
             seq_len = len(seq) + seq.num_inflight
+            if pad:
+                # Dummy rows in front, so that the sequence's own rows end the fixed-width window
+                # (see prepare_decode_with_draft_model): nothing is written for them.
+                front = max(num_drafts) - len(seq.draft_token_ids)
+                input_ids.extend([0] * front)
+                positions.extend([0] * front)
+                slot_mapping.extend([-1] * front)
             input_ids.append(0 if seq.num_inflight else seq.last_token)
             input_ids.extend(seq.draft_token_ids)
             inflight_rows.append(seq.inflight_row if seq.num_inflight else -1)
@@ -313,18 +327,21 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        num_drafts = [len(seq.draft_token_ids) for seq in seqs]
-        if len(set(num_drafts)) > 1:
+        if ragged and not pad:
             self.set_ragged_context(seqs, num_drafts, cu_seqlens_q, slot_mapping, context_lens, block_tables)
         else:
+            if pad:
+                token_index, _, num_drafts_tensor = self.ragged_layout(num_drafts, pad=True)
+                self.sampler_layout = token_index.cuda(non_blocking=True), num_drafts_tensor.cuda(non_blocking=True)
             set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def set_ragged_context(self, seqs: list[Sequence], num_drafts: list[int], cu_seqlens_q: list[int], slot_mapping: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor):
-        """The context of a ragged decode batch (speculative_per_sequence): its sequences have
-        different numbers of drafts, so the attention runs the varlen kernel over the block tables
-        instead of the fixed-width decode kernel and the CUDA graphs, and RejectionSampler gets the
-        batch's layout. The key lengths are cumulated on the GPU, where with async scheduling the
+        """The context of a ragged decode batch (speculative_per_sequence) in the "varlen" mode:
+        its sequences have different numbers of drafts, so the attention runs the varlen kernel
+        over the block tables instead of the fixed-width decode kernel and the CUDA graphs, and
+        RejectionSampler gets the batch's layout. (The "pad" mode keeps the fixed-width kernel, see
+        prepare_decode_with_draft_model.) The key lengths are cumulated on the GPU, where with async scheduling the
         in-flight tokens are only known; their maximum is bounded from the CPU side."""
         token_index, _, num_drafts = self.ragged_layout(num_drafts)
         self.sampler_layout = token_index.cuda(non_blocking=True), num_drafts.cuda(non_blocking=True)
@@ -363,12 +380,27 @@ class ModelRunner:
         # The target scores the newest token and k drafts (propose fills them in) at positions
         # num_tokens - 1 .. num_tokens + k - 1: a row per sequence here, of which a sequence with
         # fewer drafts uses the first 1 + num_drafts (the others repeat its last position, as it
-        # has no blocks past it, and are dropped below).
-        token_index, write_index, num_drafts_tensor = self.ragged_layout(num_drafts)
+        # has no blocks past it, and are dropped below) in the "varlen" mode. In the "pad" mode its
+        # rows are the last 1 + num_drafts instead, behind dummy rows (position clamped to 0, slot
+        # masked, input 0): the fixed-width attention aligns every sequence's last row with its
+        # context length, so its own rows see exactly their keys and the dummy rows see fewer, as
+        # in the draft model's catch-up step. That keeps the kernel and the CUDA graphs; the dummy
+        # rows are the price.
+        pad = self.ragged_mode == "pad" and len(set(num_drafts)) > 1
+        token_index, write_index, num_drafts_tensor = self.ragged_layout(num_drafts, pad)
         num_drafts_tensor = num_drafts_tensor.cuda(non_blocking=True)
-        positions = (num_tokens - 1).unsqueeze(1) + torch.minimum(torch.arange(k + 1, device=num_tokens.device), num_drafts_tensor.unsqueeze(1))
-        slot_mapping = (block_tables.gather(1, positions // block_size) * block_size + positions % block_size).to(torch.int32)
-        input_ids = torch.cat([last_token.unsqueeze(1), torch.zeros_like(positions[:, 1:])], dim=1)
+        cols = torch.arange(k + 1, device=num_tokens.device)
+        if pad:
+            front = (k - num_drafts_tensor).unsqueeze(1)
+            positions = ((num_tokens - 1).unsqueeze(1) + cols - front).clamp_min(0)
+            slot_mapping = block_tables.gather(1, positions // block_size) * block_size + positions % block_size
+            slot_mapping = torch.where(cols >= front, slot_mapping, -1).to(torch.int32)
+            input_ids = torch.zeros_like(positions)
+            input_ids[torch.arange(len(seqs), device=positions.device), front.squeeze(1)] = last_token
+        else:
+            positions = (num_tokens - 1).unsqueeze(1) + torch.minimum(cols, num_drafts_tensor.unsqueeze(1))
+            slot_mapping = (block_tables.gather(1, positions // block_size) * block_size + positions % block_size).to(torch.int32)
+            input_ids = torch.cat([last_token.unsqueeze(1), torch.zeros_like(positions[:, 1:])], dim=1)
         self.draft_inputs = None
         if k:
             # Before drafting, the draft model catches up on the tokens its KV cache lacks: the
@@ -398,8 +430,11 @@ class ModelRunner:
             catchup_slots = torch.where((catchup_positions >= cached.unsqueeze(1)) & drafted.unsqueeze(1), catchup_slots, -1).to(torch.int32)
             self.draft_inputs = tail, padded_positions, catchup_slots
         context_lens = (num_tokens + num_drafts_tensor).to(torch.int32)
-        if len(set(num_drafts)) == 1:
-            self.draft_layout = token_index.cuda(non_blocking=True), write_index.cuda(non_blocking=True), None
+        if len(set(num_drafts)) == 1 or pad:
+            ragged = len(set(num_drafts)) > 1
+            self.draft_layout = token_index.cuda(non_blocking=True), write_index.cuda(non_blocking=True), num_drafts_tensor if ragged else None
+            if ragged:
+                self.sampler_layout = self.draft_layout[0], num_drafts_tensor
             set_context(False, slot_mapping=slot_mapping.view(-1), context_lens=context_lens, block_tables=block_tables)
             return input_ids.view(-1), positions.view(-1)
         # Ragged: keep each sequence's first 1 + num_drafts rows, and a scratch row at the end that
@@ -498,7 +533,7 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         if self.draft_model is not None and k:
             input_ids = self.propose(input_ids, positions)
-        n = sum(seq.num_scheduled_tokens for seq in seqs)    # a ragged batch's inputs end with a scratch row
+        n = input_ids.size(0) if get_context().cu_seqlens_q is None else sum(seq.num_scheduled_tokens for seq in seqs)    # a varlen ragged batch's inputs end with a scratch row
         logits = self.run_model(input_ids[:n], positions[:n], is_prefill)
         if self.draft_model is not None and is_prefill:
             self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache

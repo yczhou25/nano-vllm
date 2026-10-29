@@ -48,6 +48,9 @@ ENGINE_OPTIONS = {
     "spec_per_sequence": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5, "speculative_per_sequence": True},
     "draft_per_sequence": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True},
     "async_draft_per_sequence": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True},
+    # The same with ragged batches padded to the fixed width (dummy rows, CUDA graphs) instead of varlen attention.
+    "spec_per_sequence_pad": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5, "speculative_per_sequence": True, "speculative_ragged": "pad"},
+    "async_draft_per_sequence_pad": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True, "speculative_ragged": "pad"},
 }
 
 

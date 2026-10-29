@@ -39,13 +39,13 @@ class Violation(AssertionError):
 
 
 def make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, eos=EOS, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="varlen"):
     # Config itself requires a model directory and block sizes that are multiples of 256.
     return types.SimpleNamespace(num_kvcache_blocks=num_blocks, kvcache_block_size=block_size,
                                  max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens, eos=eos,
                                  num_speculative_tokens=num_speculative_tokens, speculative_model="fake" if draft_model else None,
                                  speculative_disable_by_batch_size=speculative_disable_by_batch_size, speculative_min_acceptance=speculative_min_acceptance,
-                                 speculative_per_sequence=speculative_per_sequence)
+                                 speculative_per_sequence=speculative_per_sequence, speculative_ragged=speculative_ragged)
 
 
 def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
@@ -59,12 +59,13 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
     runner.draft_model = None
     runner.draft_inputs = None
     runner.draft_layout = runner.sampler_layout = None
+    runner.ragged_mode = "varlen"
     runner.graphs = runner.draft_graphs = runner.graph_pool = None    # no CUDA graphs: forward runs eagerly
     return runner
 
 
 def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="varlen"):
     assert not (async_scheduling and num_speculative_tokens and not draft_model)
     engine = LLMEngine.__new__(LLMEngine)
     engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens,
@@ -72,6 +73,7 @@ def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, as
                                              speculative_disable_by_batch_size=speculative_disable_by_batch_size,
                                              speculative_min_acceptance=speculative_min_acceptance, speculative_per_sequence=speculative_per_sequence))
     engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks, num_speculative_tokens=num_speculative_tokens, draft_model=draft_model)
+    engine.model_runner.runner.ragged_mode = speculative_ragged
     engine.async_scheduling = async_scheduling
     engine.pending = None
     return engine
@@ -376,8 +378,9 @@ class FakeModel:
             raise Violation(f"decode step with {qs} tokens per sequence")
         if scheduler.speculative_disable_by_batch_size is None and scheduler.speculative_min_acceptance is None and q != 1 + K:
             raise Violation(f"decode step with {q} tokens per sequence, expected {1 + K}")
-        starts = [sum(qs[:i]) for i in range(len(qs))]    # each sequence's first row in the inputs
         ragged = len(set(qs)) > 1
+        pad = ragged and self.runner.ragged_mode == "pad"    # every sequence gets q rows, its own right-aligned behind dummy rows
+        starts = [i * q + q - qs[i] if pad else sum(qs[:i]) for i in range(len(qs))]    # each sequence's first own row in the inputs
         capped, self.num_capped_steps = scheduler.num_capped_steps > self.num_capped_steps, scheduler.num_capped_steps
         if per_sequence and capped:
             # The batch-size rule still switches every sequence's drafts off. The scheduler counts
@@ -416,24 +419,32 @@ class FakeModel:
                 raise Violation(f"decode step with {q - 1} drafts, expected {expected} at acceptance {[round(a, 3) for a in scheduler.acceptance[1:]]} "
                                 f"after {self.steps_without_probe} steps without a probe")
             self.steps_without_probe = 0 if q - 1 == K else self.steps_without_probe + 1
-        n = sum(qs)
-        if len(ids) != n + (ragged and self.draft_kv is not None) or len(slots) != n:    # a ragged batch with a draft model has a scratch row
+        n = len(seqs) * q if pad else sum(qs)
+        if len(ids) != n + (ragged and not pad and self.draft_kv is not None) or len(slots) != n:    # a varlen ragged batch with a draft model has a scratch row
             raise Violation(f"{len(ids)} decode inputs and {len(slots)} slots for {len(seqs)} seqs with {qs} tokens each")
-        # A ragged batch runs the varlen attention: it carries the query and key offsets, and the
-        # rejection sampler's layout; a uniform one must not, so that it takes the CUDA graphs.
-        if not ragged and (meta["cu_seqlens_q"] is not None or meta["sampler_layout"] is not None):
-            raise Violation("a uniform decode batch carries varlen or ragged sampler inputs")
+        # A ragged batch in the varlen mode runs the varlen attention: it carries the query and key
+        # offsets, and the rejection sampler's layout; a uniform or padded one must not, so that it
+        # takes the CUDA graphs (a padded one carries the sampler's layout only).
+        if (not ragged or pad) and meta["cu_seqlens_q"] is not None or not ragged and meta["sampler_layout"] is not None:
+            raise Violation("a uniform or padded decode batch carries varlen or ragged sampler inputs")
         if ragged:
-            expected_k = [0]
-            for c in context_lens:
-                expected_k.append(expected_k[-1] + c)
-            layout = ModelRunner.ragged_layout([seq_q - 1 for seq_q in qs])
-            if meta["cu_seqlens_q"] != starts + [n] or meta["cu_seqlens_k"] != expected_k or meta["max_seqlen_q"] != q or meta["max_seqlen_k"] < max(context_lens):
-                raise Violation(f"ragged batch offsets cu_seqlens_q={meta['cu_seqlens_q']} cu_seqlens_k={meta['cu_seqlens_k']} max_seqlen_q={meta['max_seqlen_q']} max_seqlen_k={meta['max_seqlen_k']} for {qs} tokens and context {context_lens}")
+            layout = ModelRunner.ragged_layout([seq_q - 1 for seq_q in qs], pad)
+            if not pad:
+                expected_k = [0]
+                for c in context_lens:
+                    expected_k.append(expected_k[-1] + c)
+                if meta["cu_seqlens_q"] != starts + [n] or meta["cu_seqlens_k"] != expected_k or meta["max_seqlen_q"] != q or meta["max_seqlen_k"] < max(context_lens):
+                    raise Violation(f"ragged batch offsets cu_seqlens_q={meta['cu_seqlens_q']} cu_seqlens_k={meta['cu_seqlens_k']} max_seqlen_q={meta['max_seqlen_q']} max_seqlen_k={meta['max_seqlen_k']} for {qs} tokens and context {context_lens}")
             if meta["sampler_layout"] != [layout[0].tolist(), layout[2].tolist()]:
                 raise Violation(f"ragged sampler layout {meta['sampler_layout']} for {qs} tokens per sequence")
             if self.draft_kv is not None and meta["draft_layout"] != [t.tolist() for t in layout]:
                 raise Violation(f"ragged draft layout {meta['draft_layout']} for {qs} tokens per sequence")
+            if pad:
+                # The dummy rows write nothing and sit at a valid position.
+                for i, seq in enumerate(seqs):
+                    for r in range(i * q, starts[i]):
+                        if slots[r] != -1 or pos[r] < 0:
+                            raise Violation(f"seq {seq.seq_id}: dummy row {r} has slot {slots[r]} at position {pos[r]}")
         # Each sequence's tokens, including those of the step still in flight (async scheduling).
         all_token_ids = []
         for seq in seqs:
@@ -512,11 +523,14 @@ class FakeModel:
         # (compiled, on the GPU if there is one) with the draft tokens taken from the inputs, as
         # ModelRunner.run does.
         logits = torch.full((n, VOCAB), -1000.0, device=DEVICE)
-        logits[torch.arange(n), torch.tensor(sum(targets, []))] = 0.0
+        row_targets = [0] * n    # a dummy row (pad) is certain of token 0, which must not matter
+        for i in range(len(seqs)):
+            row_targets[starts[i]:starts[i] + qs[i]] = targets[i]
+        logits[torch.arange(n), torch.tensor(row_targets)] = 0.0
         temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=DEVICE)
         ids = torch.tensor(ids, dtype=torch.int64, device=DEVICE)
         if ragged:
-            token_index, _, num_drafts = ModelRunner.ragged_layout([seq_q - 1 for seq_q in qs])
+            token_index, _, num_drafts = ModelRunner.ragged_layout([seq_q - 1 for seq_q in qs], pad)
             token_index, num_drafts = token_index.to(DEVICE), num_drafts.to(DEVICE)
             token_ids = self.rejection_sampler(logits, temperatures, ids[token_index[:, 1:]], token_index, num_drafts)
         else:
@@ -700,7 +714,8 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
     # Acceptance: k follows the per-position acceptance rates (half the requests get good drafts).
     engine = make_engine(num_blocks, bs, max_num_seqs, max_num_batched_tokens, async_scheduling, num_speculative_tokens, draft_model,
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
-                         speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence)
+                         speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
+                         speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen")
     if acceptance:
         set_acceptance_switch(engine, rng)
     requests = random_requests(rng, bs, num_blocks * bs - num_speculative_tokens, pressure)
@@ -721,7 +736,8 @@ def run_random_case_block_256(seed, async_scheduling=False, num_speculative_toke
     max_num_batched_tokens = rng.choice([256, 300, 511, 512, 1000, 16384])
     engine = make_engine(num_blocks, bs, rng.randint(1, 6), max_num_batched_tokens, async_scheduling, num_speculative_tokens, draft_model,
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
-                         speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence)
+                         speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
+                         speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen")
     if acceptance:
         set_acceptance_switch(engine, rng)
     base = [rng.randrange(1, VOCAB) for _ in range(1200)]

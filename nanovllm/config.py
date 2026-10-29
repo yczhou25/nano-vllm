@@ -18,6 +18,7 @@ class Config:
     speculative_disable_by_batch_size: int | None = None    # decode without drafts while more sequences than this are running
     speculative_min_acceptance: float | None = None    # decode without drafts while the measured draft acceptance rate is below this
     speculative_per_sequence: bool = False    # with speculative_min_acceptance: a number of drafts per sequence, from its own acceptance rates
+    speculative_ragged: str = "varlen"    # how a batch with different numbers of drafts runs: "varlen" (a row per token, varlen attention, no CUDA graph) or "pad" (every sequence padded to the most drafts, fixed-width attention and CUDA graphs)
     hf_config: AutoConfig | None = None
     draft_hf_config: AutoConfig | None = None
     eos: int = -1
@@ -34,6 +35,7 @@ class Config:
         assert self.speculative_disable_by_batch_size is None or (self.num_speculative_tokens and self.speculative_disable_by_batch_size >= 1)
         assert self.speculative_min_acceptance is None or (self.num_speculative_tokens and 0.0 <= self.speculative_min_acceptance <= 1.0)
         assert not self.speculative_per_sequence or self.speculative_min_acceptance is not None, "speculative_per_sequence needs speculative_min_acceptance"
+        assert self.speculative_ragged in ("varlen", "pad")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if self.speculative_model is not None:
