@@ -1,7 +1,7 @@
 """Per-sequence k (speculative_per_sequence): every sequence keeps its own acceptance rate per
-draft position, over its last ACCEPTANCE_WINDOW_PER_SEQUENCE steps that proposed it, and
-proposes the leading positions whose rate reaches the threshold, all of them on its first step
-and every PROBE_INTERVAL-th step of its own. Sequences in one batch can have different numbers
+draft position, over its last ACCEPTANCE_WINDOW_PER_SEQUENCE steps that proposed it (starting
+from ACCEPTANCE_PRIOR_PER_SEQUENCE accepted samples), and proposes the leading positions whose rate
+reaches the threshold, all of them on its first step and on the batch's probe steps. Sequences in one batch can have different numbers
 of drafts (a ragged batch). The scheduler is driven directly, with made-up sampler outputs."""
 from engine_sim import make_config
 from nanovllm.engine.scheduler import Scheduler
@@ -44,30 +44,32 @@ def test_each_sequence_gets_its_own_k():
     scheduler = make_scheduler(2, probe=100)
     assert decode(scheduler, [4, 0]) == [K, K]    # first step: every position, trusted until measured
     good, bad = scheduler.running
-    assert rates(good) == [1.0] * K and rates(bad) == [0.0] * K
+    assert rates(good) == [1.0] * K and rates(bad) == [0.5] * K    # (1 prior + 0) / 2: one rejection does not strip a sequence
+    assert decode(scheduler, [4, 0]) == [K, K]
+    assert rates(bad) == [0.333] * K
     assert decode(scheduler, [4, 0]) == [K, 0]    # a ragged batch
-    assert decode(scheduler, [1, 0]) == [K, 0]    # good: positions 2-4 accepted 2/3
-    assert rates(good) == [1.0, 0.667, 0.667, 0.667]
-    assert decode(scheduler, [1, 0]) == [K, 0]    # 2/4, not below 0.5
-    assert decode(scheduler, [1, 0]) == [K, 0]    # the window is full: (0.5 * 4 + 0) / 5
-    assert rates(good) == [1.0, 0.4, 0.4, 0.4]
+    assert decode(scheduler, [1, 0]) == [K, 0]    # good: positions 2-4 accepted 4/5 (window 4 full, the step weighs 1/5)
+    assert rates(good) == [1.0, 0.8, 0.8, 0.8]
+    assert [decode(scheduler, [1, 0]) for _ in range(3)] == [[K, 0]] * 3    # 0.64, 0.512, 0.41
     assert decode(scheduler, [1, 0]) == [1, 0]
-    assert rates(good) == [1.0, 0.4, 0.4, 0.4]    # positions it did not propose keep their rate
-    assert scheduler.num_ragged_steps == 5 and scheduler.num_decode_steps == 6
+    assert rates(good) == [1.0, 0.41, 0.41, 0.41]    # positions it did not propose keep their rate
+    assert scheduler.num_ragged_steps == 6 and scheduler.num_decode_steps == 8
 
 
 def test_the_batch_rates_do_not_leak_between_sequences():
     scheduler = make_scheduler(3, probe=100)
     decode(scheduler, [4, 4, 0])
-    assert [rates(seq) for seq in scheduler.running] == [[1.0] * K, [1.0] * K, [0.0] * K]
-    assert scheduler.acceptance[1:] == [2 / 3] * K    # the batch-wide rates are kept for the statistics
+    assert [rates(seq) for seq in scheduler.running] == [[1.0] * K, [1.0] * K, [0.5] * K]
+    assert scheduler.acceptance[1:] == [2 / 3] * K    # the batch-wide rates are kept for the statistics, without the prior
+    assert decode(scheduler, [4, 4, 0]) == [K, K, K]
     assert decode(scheduler, [4, 4, 4]) == [K, K, 0]
 
 
 def test_a_new_sequence_starts_with_every_position():
     scheduler = make_scheduler(1, probe=100)
     assert decode(scheduler, [0]) == [K]
-    assert decode(scheduler, [0]) == [0]
+    assert decode(scheduler, [0]) == [K]    # 1/2
+    assert decode(scheduler, [0]) == [0]    # 1/3
     scheduler.add(Sequence([1, 2, 3], SamplingParams(max_tokens=10 ** 6, ignore_eos=True)))
     seqs, is_prefill = scheduler.schedule()
     assert is_prefill and len(seqs) == 1
@@ -81,19 +83,22 @@ def test_probes_are_the_batchs_one_uniform_step():
     # CUDA graphs), rather than each sequence probing at its own time in a ragged step.
     scheduler = make_scheduler(2, probe=3)
     assert decode(scheduler, [0, 4]) == [K, K]
-    assert [decode(scheduler, [0, 4]) for _ in range(7)] == [[0, K], [0, K], [0, K], [K, K], [0, K], [0, K], [0, K]]
-    assert scheduler.num_steps_by_k == [6, 0, 0, 0, 10]    # sequence-steps in this mode
+    assert decode(scheduler, [0, 4]) == [K, K]    # the first sequence at 1/2
+    assert [decode(scheduler, [0, 4]) for _ in range(6)] == [[0, K], [0, K], [0, K], [K, K], [0, K], [0, K]]
+    assert scheduler.num_steps_by_k == [5, 0, 0, 0, 11]    # sequence-steps in this mode
 
 
 def test_a_shorter_step_counts_towards_the_probe_and_leaves_later_positions_alone():
     scheduler = make_scheduler(1, probe=5)
     assert decode(scheduler, [1]) == [K]
     seq, = scheduler.running
-    assert rates(seq) == [1.0, 0.0, 0.0, 0.0] and seq.num_acceptance_samples == [0, 1, 1, 1, 1]
+    assert rates(seq) == [1.0, 0.5, 0.5, 0.5] and seq.num_acceptance_samples == [0, 2, 2, 2, 2]    # the prior and one sample
+    assert decode(scheduler, [1]) == [K]
+    assert rates(seq) == [1.0, 0.333, 0.333, 0.333] and seq.num_acceptance_samples == [0, 3, 3, 3, 3]
     for _ in range(5):
         assert decode(scheduler, [4]) == [1]
-    assert rates(seq) == [1.0, 0.0, 0.0, 0.0] and seq.num_acceptance_samples == [0, 4, 1, 1, 1]    # window 4
-    assert decode(scheduler, [4]) == [K]    # the probe: 1/2 each
+    assert rates(seq) == [1.0, 0.333, 0.333, 0.333] and seq.num_acceptance_samples == [0, 4, 3, 3, 3]    # window 4
+    assert decode(scheduler, [4]) == [K]    # the probe: (1/3 * 3 + 1) / 4
     assert rates(seq) == [1.0, 0.5, 0.5, 0.5]
 
 
@@ -120,16 +125,18 @@ def test_batch_size_rule_still_applies_to_every_sequence():
 def test_statistics_count_sequence_steps_and_positions():
     scheduler = make_scheduler(2, probe=100)
     assert decode(scheduler, [4, 1]) == [K, K]
+    assert decode(scheduler, [4, 1]) == [K, K]
     assert decode(scheduler, [4, 1]) == [K, 1]
-    assert scheduler.num_steps_by_k == [0, 1, 0, 0, 3]
-    assert scheduler.num_proposed_by_position == [0, 4, 3, 3, 3] and scheduler.num_accepted_by_position == [0, 4, 2, 2, 2]
-    assert (scheduler.num_draft_tokens, scheduler.num_accepted_tokens) == (13, 10)
+    assert scheduler.num_steps_by_k == [0, 1, 0, 0, 5]
+    assert scheduler.num_proposed_by_position == [0, 6, 5, 5, 5] and scheduler.num_accepted_by_position == [0, 6, 3, 3, 3]
+    assert (scheduler.num_draft_tokens, scheduler.num_accepted_tokens) == (21, 15)
     scheduler.reset_stats()
     assert scheduler.num_steps_by_k == [0] * 5 and scheduler.num_decode_steps == scheduler.num_ragged_steps == 0
 
 
 def test_ngram_drafts_are_cut_per_sequence():
     scheduler = make_scheduler(2, probe=100, draft_model=False)
+    assert decode(scheduler, [4, 0]) == [K, K]
     assert decode(scheduler, [4, 0]) == [K, K]
     seqs, _ = scheduler.schedule()
     assert [len(seq.draft_token_ids) for seq in seqs] == [K, 0] and [seq.num_scheduled_tokens for seq in seqs] == [K + 1, 1]

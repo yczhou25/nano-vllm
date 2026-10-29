@@ -21,6 +21,7 @@ class Scheduler:
     ACCEPTANCE_WINDOW = 64    # sequence-steps per position, or ACCEPTANCE_MIN_STEPS steps if that is more
     ACCEPTANCE_MIN_STEPS = 8  # a large batch fills 64 samples in two steps, too few to decide on
     ACCEPTANCE_WINDOW_PER_SEQUENCE = 16    # steps of one sequence: small, so a sequence that stops copying its prompt is noticed within a few steps
+    ACCEPTANCE_PRIOR_PER_SEQUENCE = 1      # accepted samples a new sequence starts with per position: one rejection leaves it at 1/2, not 0
     PROBE_INTERVAL = 16       # decode steps
 
     def __init__(self, config: Config):
@@ -48,9 +49,13 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        if self.speculative_per_sequence:    # trusted until measured, like the batch-wide rates
+        if self.speculative_per_sequence:
+            # Trusted until measured, like the batch-wide rates, but with ACCEPTANCE_PRIOR_PER_SEQUENCE
+            # optimistic samples behind the trust: a sequence has one sample per step and position, so
+            # without them its first rejected draft (the n-gram proposer's, before the prompt is
+            # repeated; a draft model's near-tie) would strip it of that position until the next probe.
             seq.acceptance = [1.0] * (self.num_speculative_tokens + 1)
-            seq.num_acceptance_samples = [0] * (self.num_speculative_tokens + 1)
+            seq.num_acceptance_samples = [0] + [self.ACCEPTANCE_PRIOR_PER_SEQUENCE] * self.num_speculative_tokens
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
