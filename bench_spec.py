@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--max-prompt-tokens", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--greedy-drafts", action="store_true", help="a draft model proposes its argmax (one-hot q) instead of sampling at the sequence's temperature with min(1, p/q) verification")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument("--speculative-disable-by-batch-size", type=int, default=None, help="decode without drafts while more sequences than this are running")
@@ -61,7 +62,8 @@ def main():
     args = parser.parse_args()
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,
-              speculative_model=args.speculative_model, speculative_min_acceptance=args.speculative_min_acceptance, speculative_per_sequence=args.speculative_per_sequence, speculative_ragged=args.speculative_ragged)
+              speculative_model=args.speculative_model, speculative_min_acceptance=args.speculative_min_acceptance, speculative_per_sequence=args.speculative_per_sequence, speculative_ragged=args.speculative_ragged,
+              speculative_sampled_drafts=not args.greedy_drafts)
     prompts = build_prompts(llm.tokenizer, args.workload, args.num_prompts, args.max_prompt_tokens)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
     llm.generate(prompts[:1], SamplingParams(max_tokens=16), use_tqdm=False)    # warmup
@@ -86,7 +88,7 @@ def main():
     acc_pos = ",".join(f"{a / p:.2f}" if p else "-" for p, a in zip(scheduler.num_proposed_by_position[1:], scheduler.num_accepted_by_position[1:]))
     k_steps = ",".join(map(str, scheduler.num_steps_by_k))
     steps = max(scheduler.num_decode_steps, 1)
-    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} probe={scheduler.PROBE_INTERVAL} per_seq={int(args.speculative_per_sequence)} ragged_mode={args.speculative_ragged} batch={args.batch_size} T={args.temperature} "
+    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} probe={scheduler.PROBE_INTERVAL} per_seq={int(args.speculative_per_sequence)} ragged_mode={args.speculative_ragged} batch={args.batch_size} T={args.temperature} sampled_drafts={int(not args.greedy_drafts)} "
           f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f} acc_pos={acc_pos} k_steps={k_steps} "
           f"ragged={scheduler.num_ragged_steps / steps:.2f} capped={scheduler.num_capped_steps / steps:.2f}")
 

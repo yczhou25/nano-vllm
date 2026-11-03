@@ -60,12 +60,15 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
     runner.draft_inputs = None
     runner.draft_layout = runner.sampler_layout = None
     runner.ragged_mode = "varlen"
+    runner.sampled_drafts = True    # a draft model samples its drafts and keeps their distributions (see propose)
+    runner.draft_probs = None
     runner.graphs = runner.draft_graphs = runner.graph_pool = None    # no CUDA graphs: forward runs eagerly
     return runner
 
 
 def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad"):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad",
+                speculative_sampled_drafts=True):
     assert not (async_scheduling and num_speculative_tokens and not draft_model)
     engine = LLMEngine.__new__(LLMEngine)
     engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens,
@@ -74,6 +77,7 @@ def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, as
                                              speculative_min_acceptance=speculative_min_acceptance, speculative_per_sequence=speculative_per_sequence))
     engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks, num_speculative_tokens=num_speculative_tokens, draft_model=draft_model)
     engine.model_runner.runner.ragged_mode = speculative_ragged
+    engine.model_runner.runner.sampled_drafts = speculative_sampled_drafts
     engine.async_scheduling = async_scheduling
     engine.pending = None
     return engine
@@ -352,7 +356,20 @@ class FakeModel:
                     block_tables=torch.tensor(meta["block_tables"], dtype=torch.int32))
         self.runner.draft_inputs = tuple(torch.tensor(t, dtype=dtype) for t, dtype in zip(meta["draft_inputs"], meta["draft_dtypes"]))
         self.runner.draft_layout = tuple(torch.tensor(t) if t is not None else None for t in meta["draft_layout"])
-        ids = self.runner.propose(torch.tensor(meta["input_ids"], dtype=torch.int64), torch.tensor(meta["positions"], dtype=torch.int64)).tolist()
+        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32)
+        ids = self.runner.propose(torch.tensor(meta["input_ids"], dtype=torch.int64), torch.tensor(meta["positions"], dtype=torch.int64), temperatures).tolist()
+        draft_probs = self.runner.draft_probs
+        if self.runner.sampled_drafts:
+            # The distributions the drafts were sampled from, one row per sequence and draft
+            # position, each (the fake draft is certain of its token) peaking at the draft.
+            if draft_probs is None or tuple(draft_probs.shape) != (len(seqs), max(num_drafts), VOCAB):
+                raise Violation(f"draft_probs {None if draft_probs is None else tuple(draft_probs.shape)} for {len(seqs)} seqs and {max(num_drafts)} drafts")
+            peaks = draft_probs.argmax(dim=-1).tolist()
+            for i, seq in enumerate(seqs):
+                if peaks[i][:num_drafts[i]] != draft_model.drafts[i]:
+                    raise Violation(f"seq {seq.seq_id}: draft_probs peak at {peaks[i][:num_drafts[i]]}, drafts {draft_model.drafts[i]}")
+        elif draft_probs is not None:
+            raise Violation("draft_probs set without sampled drafts")
         c = get_context()
         if c.is_prefill or c.context_lens.tolist() != meta["context_lens"] or c.slot_mapping.tolist() != meta["slot_mapping"]:
             raise Violation("propose did not restore the target's context")
@@ -529,12 +546,13 @@ class FakeModel:
         logits[torch.arange(n), torch.tensor(row_targets)] = 0.0
         temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=DEVICE)
         ids = torch.tensor(ids, dtype=torch.int64, device=DEVICE)
+        draft_probs = self.runner.draft_probs.to(DEVICE) if self.runner.draft_probs is not None else None    # one-hot-like: the sampler's q path must agree with the one-hot path
         if ragged:
             token_index, _, num_drafts = ModelRunner.ragged_layout([seq_q - 1 for seq_q in qs], pad)
             token_index, num_drafts = token_index.to(DEVICE), num_drafts.to(DEVICE)
-            token_ids = self.rejection_sampler(logits, temperatures, ids[token_index[:, 1:]], token_index, num_drafts)
+            token_ids = self.rejection_sampler(logits, temperatures, ids[token_index[:, 1:]], token_index, num_drafts, draft_probs)
         else:
-            token_ids = self.rejection_sampler(logits, temperatures, ids.view(len(seqs), q)[:, 1:])
+            token_ids = self.rejection_sampler(logits, temperatures, ids.view(len(seqs), q)[:, 1:], draft_probs=draft_probs)
         token_ids = accepted_token_ids(token_ids.tolist())
         for i, seq in enumerate(seqs):
             accepted = next(j for j in range(qs[i]) if j == qs[i] - 1 or all_drafts[i][j] != targets[i][j])
@@ -715,7 +733,8 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
     engine = make_engine(num_blocks, bs, max_num_seqs, max_num_batched_tokens, async_scheduling, num_speculative_tokens, draft_model,
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
                          speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
-                         speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen")
+                         speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen",
+                         speculative_sampled_drafts=rng.random() < 0.7)
     if acceptance:
         set_acceptance_switch(engine, rng)
     requests = random_requests(rng, bs, num_blocks * bs - num_speculative_tokens, pressure)
@@ -737,7 +756,8 @@ def run_random_case_block_256(seed, async_scheduling=False, num_speculative_toke
     engine = make_engine(num_blocks, bs, rng.randint(1, 6), max_num_batched_tokens, async_scheduling, num_speculative_tokens, draft_model,
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
                          speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
-                         speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen")
+                         speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen",
+                         speculative_sampled_drafts=rng.random() < 0.7)
     if acceptance:
         set_acceptance_switch(engine, rng)
     base = [rng.randrange(1, VOCAB) for _ in range(1200)]

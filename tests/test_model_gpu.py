@@ -39,6 +39,7 @@ ENGINE_OPTIONS = {
     "async_draft": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL},
     # Drafts only while at most 2 sequences run: the 4 questions decode without them, the 2 documents with them.
     "draft_adaptive": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_disable_by_batch_size": 2},
+    "draft_greedy_drafts": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_sampled_drafts": False},
     # Acceptance switch: n-gram drafts of the questions are mostly rejected, so decode runs mostly without them,
     # with a probe step now and then; the draft model's are mostly accepted (always, when it is the target itself).
     "spec_acceptance": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5},
@@ -140,6 +141,24 @@ def test_ragged_batch_matches_reference(llm, reference):
         check(reference, prompt, completion)
     if not scheduler.has_draft_model:
         assert scheduler.num_ragged_steps, "the copying task keeps its n-gram drafts while the questions lose theirs"
+
+
+def test_sampled_drafts_from_the_target_itself_are_nearly_all_accepted(llm):
+    # Exact speculative sampling with the target drafting for itself: q is p up to kernel noise
+    # (CUDA graph against eager, bf16), so min(1, p/q) accepts nearly every draft at temperature 1.
+    # Argmax drafts are accepted with p(argmax), the model's confidence, far below that.
+    from nanovllm import SamplingParams
+    scheduler = llm.scheduler
+    if not scheduler.has_draft_model or not os.path.samefile(DRAFT_MODEL, MODEL) or scheduler.speculative_min_acceptance is not None or scheduler.speculative_disable_by_batch_size is not None:
+        pytest.skip("a draft model drafting for itself with every draft only")
+    prompts = [chat(llm.tokenizer, q) for q in QUESTIONS]
+    scheduler.reset_stats()
+    llm.generate(prompts, SamplingParams(temperature=1.0, max_tokens=MAX_TOKENS, ignore_eos=True), use_tqdm=False)
+    acceptance = scheduler.num_accepted_tokens / scheduler.num_draft_tokens
+    if llm.model_runner.sampled_drafts:
+        assert acceptance > 0.9, acceptance
+    else:
+        assert 0.2 < acceptance < 0.95, acceptance
 
 
 def test_sampling_returns_max_tokens(llm):

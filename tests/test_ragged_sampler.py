@@ -99,3 +99,28 @@ def test_sampled_rows_follow_the_target_distribution(temperature):
     both_accepted = first_accepted & (with_drafts[:, 1] == 5)
     assert both_accepted.sum().item() > 500
     assert (freq(with_drafts[both_accepted, 2]) - probs[2]).abs().max().item() < 0.03
+
+
+def test_sampled_drafts_on_a_ragged_batch_give_the_target_distribution():
+    # Exact speculative sampling through the ragged branch: the sequence with two sampled drafts
+    # follows the target at every position, the one without any samples from the target directly.
+    from test_sampler import TARGET_LOGITS, DRAFT_LOGITS, check_speculative_sampling
+    torch.manual_seed(0)
+    n, temperature = 50000, 1.0
+    target, draft = torch.tensor(TARGET_LOGITS, device=DEVICE), torch.tensor(DRAFT_LOGITS, device=DEVICE)
+    p, q = torch.softmax(target / temperature, dim=-1), torch.softmax(draft / temperature, dim=-1)
+    drafts = torch.stack([torch.multinomial(q[j], n, replacement=True) for j in range(2)], dim=1)
+    logits = torch.zeros(4 * n, 6, device=DEVICE)    # per pair: the drafting sequence's 3 rows, then the other's row
+    logits.view(n, 4, 6)[:, :3] = target
+    logits.view(n, 4, 6)[:, 3] = target[2]
+    input_ids = torch.zeros(4 * n, dtype=torch.int64, device=DEVICE)
+    input_ids.view(n, 4)[:, 1:3] = drafts
+    draft_probs = torch.zeros(2 * n, 2, 6, device=DEVICE)
+    draft_probs[0::2] = q[:2]
+    token_index, _, num_drafts = ModelRunner.ragged_layout([2, 0] * n)
+    token_index, num_drafts = token_index.to(DEVICE), num_drafts.to(DEVICE)
+    out = RejectionSampler()(logits, torch.full((2 * n,), temperature, device=DEVICE), input_ids[token_index[:, 1:]], token_index, num_drafts, draft_probs)
+    check_speculative_sampling(out[0::2], drafts, p, q, tolerance=0.015)
+    without = out[1::2]
+    assert (without[:, 1:] == -1).all()
+    assert (torch.bincount(without[:, 0], minlength=6).float() / n - p[2]).abs().max().item() < 0.015

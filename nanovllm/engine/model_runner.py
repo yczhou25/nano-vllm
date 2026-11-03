@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler, RejectionSampler, accepted_token_ids
+from nanovllm.layers.sampler import Sampler, RejectionSampler, accepted_token_ids, sample_drafts
 from nanovllm.utils.context import set_context, get_context, restore_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -43,6 +43,8 @@ class ModelRunner:
         self.draft_model = None
         self.draft_inputs = None      # the draft model's decode inputs, prepared with the target's
         self.ragged_mode = config.speculative_ragged    # how a ragged batch runs: "varlen" or "pad" (see prepare_decode)
+        self.sampled_drafts = config.speculative_sampled_drafts    # a draft model samples its drafts (see propose), with the distributions kept for the sampler
+        self.draft_probs = None       # (batch_size, k, vocab_size): the distribution each draft was sampled from, in a step that sampled them
         self.draft_layout = None      # where each sequence's drafts go in the decode inputs (see ragged_layout)
         self.sampler_layout = None    # the same for RejectionSampler, in a ragged batch only
         self.graphs = None            # CUDA graphs by decode batch size, once captured (see capture_cudagraph)
@@ -158,8 +160,10 @@ class ModelRunner:
         torch.compile specializes sizes 0 and 1, so a batch of one sequence (the tail of every
         batch) and a step with one draft are shapes of their own, compiled here as well. The inputs
         are like the real ones in everything else the compiled code guards on: dtype, device,
-        strides (the drafts are a column slice of the step's input ids) and grad mode."""
+        strides (the drafts are a column slice of the step's input ids) and grad mode. A draft
+        model that samples its drafts passes their distributions (draft_probs), another branch."""
         hf_config = self.config.hf_config
+        sampled = self.draft_model is not None and self.sampled_drafts
         with torch.inference_mode():
             for batch_size in (8, 1):
                 temperatures = torch.ones(batch_size, dtype=torch.float32, device="cuda")
@@ -170,6 +174,9 @@ class ModelRunner:
                     else:
                         input_ids = torch.zeros(batch_size, q, dtype=torch.int64, device="cuda")
                         self.rejection_sampler(logits, temperatures, input_ids[:, 1:])
+                        if sampled:
+                            draft_probs = torch.full((batch_size, q - 1, hf_config.vocab_size), 1.0 / hf_config.vocab_size, dtype=torch.float32, device="cuda")
+                            self.rejection_sampler(logits, temperatures, input_ids[:, 1:], draft_probs=draft_probs)
             if self.config.speculative_per_sequence:
                 # Ragged batches (at least two sequences, every number of drafts up to K) take the
                 # sampler's other branch, with the drafts gathered by the batch's layout.
@@ -183,6 +190,9 @@ class ModelRunner:
                     input_ids = torch.zeros(n + 1, dtype=torch.int64, device="cuda")
                     token_index, num_drafts = token_index.cuda(), num_drafts.cuda()
                     self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts)
+                    if sampled:
+                        draft_probs = torch.full((batch_size, k, hf_config.vocab_size), 1.0 / hf_config.vocab_size, dtype=torch.float32, device="cuda")
+                        self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts, draft_probs)
 
     def kv_cache_block_bytes(self, hf_config) -> int:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -486,12 +496,15 @@ class ModelRunner:
         return self.model.compute_logits(self.forward(self.model, graphs, outputs, input_ids, positions, is_prefill))
 
     @torch.inference_mode()
-    def propose(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Run the draft model k times and write its greedy tokens into the draft columns of
-        input_ids (one row of batch_size * (k + 1)). The proposals are deterministic given the
-        context, so RejectionSampler stays exact. The first step scores the tokens the draft KV
-        cache lacks (see prepare_decode_with_draft_model) and proposes from the newest token's
-        logits; each later step scores the draft just proposed."""
+    def propose(self, input_ids: torch.Tensor, positions: torch.Tensor, temperatures: torch.Tensor | None = None) -> torch.Tensor:
+        """Run the draft model k times and write its tokens into the draft columns of input_ids
+        (one row of batch_size * (k + 1)). With speculative_sampled_drafts and the sequences'
+        temperatures (rank 0), each draft is sampled from the draft's distribution at the
+        sequence's temperature and that distribution is kept in draft_probs for RejectionSampler,
+        which then accepts with min(1, p/q) (exact speculative sampling); otherwise the drafts are
+        the draft's argmax, one-hot proposals the sampler accepts with p. The first step scores the
+        tokens the draft KV cache lacks (see prepare_decode_with_draft_model) and proposes from the
+        newest token's logits; each later step scores the draft just proposed."""
         context = get_context()    # the target's
         context_lens, block_tables = context.context_lens, context.block_tables
         tokens, catchup_positions, catchup_slots = self.draft_inputs
@@ -501,6 +514,8 @@ class ModelRunner:
         bs, m = tokens.shape
         k = token_index.size(1) - 1
         slot_mapping = context.slot_mapping
+        sampling = self.sampled_drafts and temperatures is not None and self.rank == 0
+        self.draft_probs = None
         for i in range(k):
             if i == 0:
                 q, step_positions, step_slots = m, catchup_positions, catchup_slots
@@ -519,20 +534,27 @@ class ModelRunner:
             graphs, outputs = (self.draft_graphs.get(q), self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
             hidden_states = self.forward(self.draft_model, graphs, outputs, tokens.reshape(-1), step_positions.reshape(-1), False)
             logits = self.draft_model.compute_logits(hidden_states[q - 1::q])
-            tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")
+            if sampling:
+                tokens, probs = sample_drafts(logits, temperatures)
+                if i == 0:
+                    self.draft_probs = torch.empty((bs, k) + probs.shape[1:], dtype=probs.dtype, device=probs.device)
+                self.draft_probs[:, i] = probs
+            else:
+                tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")
             if self.world_size > 1:
                 dist.broadcast(tokens, 0)
             input_ids[write_index[:, i]] = tokens
         restore_context(context)
         return input_ids
 
-    def decode_logits(self, seqs: list[Sequence], is_prefill: bool) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def decode_logits(self, seqs: list[Sequence], is_prefill: bool, temperatures: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, int]:
         """The step's inputs, drafts included, its logits, and its number of drafts (the most any
         sequence has: with speculative_per_sequence a batch can be ragged, see ragged_layout)."""
         k = 0 if is_prefill else max(seq.num_scheduled_tokens for seq in seqs) - 1
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        self.draft_probs = None
         if self.draft_model is not None and k:
-            input_ids = self.propose(input_ids, positions)
+            input_ids = self.propose(input_ids, positions, temperatures)
         n = input_ids.size(0) if get_context().cu_seqlens_q is None else sum(seq.num_scheduled_tokens for seq in seqs)    # a varlen ragged batch's inputs end with a scratch row
         logits = self.run_model(input_ids[:n], positions[:n], is_prefill)
         if self.draft_model is not None and is_prefill:
@@ -545,14 +567,14 @@ class ModelRunner:
         if not k:
             return self.sampler(logits, temperatures)
         if self.sampler_layout is None:
-            return self.rejection_sampler(logits, temperatures, input_ids[:len(seqs) * (k + 1)].view(len(seqs), k + 1)[:, 1:])
+            return self.rejection_sampler(logits, temperatures, input_ids[:len(seqs) * (k + 1)].view(len(seqs), k + 1)[:, 1:], draft_probs=self.draft_probs)
         token_index, num_drafts = self.sampler_layout
-        return self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts)
+        return self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts, self.draft_probs)
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        input_ids, logits, k = self.decode_logits(seqs, is_prefill)
+        input_ids, logits, k = self.decode_logits(seqs, is_prefill, temperatures)
         token_ids = None
         if self.rank == 0:
             token_ids = self.sample(seqs, input_ids, logits, temperatures, k).tolist()
@@ -566,7 +588,7 @@ class ModelRunner:
         """Like run, but returns before the GPU finishes. The sampled tokens stay on the GPU as
         inputs for the next decode step, and are copied to the host in the background."""
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        input_ids, logits, k = self.decode_logits(seqs, is_prefill)
+        input_ids, logits, k = self.decode_logits(seqs, is_prefill, temperatures)
         if self.rank == 0:
             token_ids = self.sample(seqs, input_ids, logits, temperatures, k)
         else:

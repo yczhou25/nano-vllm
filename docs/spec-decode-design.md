@@ -484,18 +484,53 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 - GPU 测试 42/44（8 个跳过），和 233732 一样挂在 n-gram 两种按序列模式的混合 batch 用例（`num_ragged_steps == 0`，输出和参考一致），说明 cc2a84a 的先验不是它的原因；原因见做法一节（测试的 prompt 开着思考模式，抄写任务没开始抄），用例已改，作业 234580 验证通过（44/44）。
 - 重编译 345 次，比 233732 的 292 次多的是 pad 行的预热；都在计时之前。
 
+## 温度采样下的无损投机解码：草稿按分布采样（2026-11-03 加）
+
+`LLM(..., speculative_model=..., speculative_sampled_drafts=True)`（有草稿模型时默认开；`False` 回到 argmax 草稿）。之前草稿模型的提案一直是 argmax，q 是 one-hot，拒绝采样按 `p(d)` 接受、被拒后从"p 去掉 d"里重采——这在贪心下是精确的，温度采样下也精确（one-hot 是 `min(1, p/q)` 的特例，见面试一节），但接受率只有 `p(argmax)`，也就是 target 对自己最可能的 token 的信心，温度一高就掉。标准做法（Leviathan 等 2023）是草稿从草稿模型自己的分布 q 里采样，验证按 `min(1, p/q)` 接受，被拒的那一位从残差 `norm(max(0, p - q))` 里重采；输出分布严格等于 target 自己采样的分布，接受率是 `Σ min(p, q)`，q 越像 p 越高——草稿模型给自己打草稿时接近 1。
+
+### 做法
+
+- **采样草稿（`sample_drafts`，`ModelRunner.propose` 里）**：草稿模型每一步的 logits 按序列各自的温度算 `q = softmax(logits / T)`，用 Gumbel 技巧（`probs / Exp(1)` 取 argmax，和 `Sampler` 一样）采一个 token；温度 0 的序列仍取 argmax。q 存进 `draft_probs`，形状 `(B, k, V)`，float32（batch 32、k=4、Qwen3 的 15 万词表是 78 MB，每步分配一次）。采样在 CUDA graph 之外（graph 只抓草稿模型的 forward），所以不碰 graph 里的随机数状态。TP 下只在 rank 0 采，token 照旧广播，q 只有 rank 0 要。
+- **验证（`RejectionSampler`）**：多一个可选参数 `draft_probs`。接受概率 `p(d_j) / q_j(d_j)`（和 `rand` 比，大于 1 就是必收）；被拒那一位的残差 `max(0, p - q_j)`，`torch.where` 按"真的拒了"（不是全收、也不是 ragged 的补位）选残差还是 p；残差全零（p 和 q 完全相同，理论上不会拒）时回退到 p。贪心行不看 q，照旧只收 argmax。`draft_probs=None` 走原来的 one-hot 路径（n-gram、argmax 草稿）。ragged batch 的 `token_index` 分支一样接 q：q 按序列和位，补位不读。
+- **异步调度**：q 和草稿在同一步里产生、同一步里消费（`run_async` 里 `propose` 之后就是 `sample`），不跨步，所以在途 token 的机制一个字不改。
+- 预热：`warmup_samplers` 对 `draft_probs` 分支（统一和 ragged）各编一次；bench 加 `--greedy-drafts`，行里多一个 `sampled_drafts=` 字段。
+
+### 正确性验证（CPU）
+
+- `tests/test_sampler.py`：`sample_drafts` 的频率等于 `softmax(logits/T)`、返回的 q 就是它、贪心行取 argmax；**核心用例**：三个位置各一个 target 分布和一个不同的草稿分布（词表 6，T ∈ {0.7, 1, 1.5}），10 万个 batch，草稿从 q 采，跑真实的采样器——每个位置上输出 token 的频率等于 target 分布（误差 < 0.012），第 j 位的接受率等于 `Σ min(p_j, q_j)`，被拒之后的 token 从不等于被拒的草稿；one-hot 的 q 和 `None` 路径在相同随机数下收同样的草稿、重采的 token 99.9% 相同；贪心行传不传 q 结果逐位相同。
+- `tests/test_ragged_sampler.py`：ragged batch（一条两个草稿、一条没有）上同样的分布检验。
+- 模拟器：`_propose` 把序列温度传给真实的 `propose`，核对 `draft_probs` 的形状 `(B, k_max, V)` 和每行的峰值等于那条序列的草稿（假草稿模型给自己的 token 一个确定的 one-hot logits，采样结果和 argmax 一致，所以其余检查原样有效）；采样器调用带上 q，随机用例里 70% 开采样。所有既有检查（KV、哈希块、输出等于参考）照旧。
+- 变异（8 种，分布检验全抓到 7 种）：
+
+| 注入的 bug | 结果 |
+|---|---|
+| 按 p 接受而不是 p/q | 抓到 |
+| 残差不 clamp（p−q 有负数） | 抓到 |
+| 残差用 p（不减 q） | 抓到 |
+| 残差用前一位的 q | 抓到 |
+| 全收之后也用残差 | 抓到 |
+| 残差不归一化 | 等价变异：Gumbel 采样对缩放不敏感，不是 bug |
+| 草稿采样不除温度 | 抓到（`sample_drafts` 的频率用例） |
+| q 按温度算、草稿却取 argmax | 抓到 |
+
+### 预期
+
+- chat T=0.8、Qwen3-8B + 0.6B 草稿：接受率从 `p(argmax)`（0.6B 在 chat 上的信心，估计 0.4–0.5）升到 `Σ min(p, q)`（估计 0.6 以上），batch 1 的 TPOT 相应下降；edit 上 argmax 本来就接近必中，差别小。
+- T=0 一个 token 都不该变（贪心行走原路径）：作业里放一行 T=0 的 chat 对照。
+- 代价：每步一个 `(B, k, V)` 的 float32 softmax 和一次 gather，batch 32 时几十 MB 的写读，预计 1% 以内。
+
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。
 - ngram 版和异步调度合并：要把 ngram 查找搬到 GPU 上（vLLM 的做法是 CPU 上查、但等上一步落地，等于放弃了异步）。草稿模型版已经合并（见上）。
 - k 自适应：按 batch 大小关草稿已做并复测（batch 32 关草稿时 edit ×0.98、chat ×1.00）；按每个草稿位的接受率调 k 已做并同场复测（草稿模型上 edit batch 1 ×3.2、chat batch 32 ×1.19，固定 k=4 只有 ×1.04；n-gram 在 chat batch 32 上从 ×0.74 回到 ×0.99，差距查清是三条 `torch.compile` 守卫，见上）。每条序列一个 k（混合负载需要）已做并在 A40 上量完（见上）：机制对、接受率涨，但哪一格都没赢过 batch 级开关——varlen 丢 CUDA graph，pad 算的行和草稿步数与 batch 用 k_max 一样多，而混合负载里"白算"的位置在读权重为主的 decode 下本来只值两个点；要赢得把 ragged 注意力放进 CUDA graph（按总行数分桶）并让草稿模型只给需要的序列跑需要的步数，还没做。还没做的还有把 batch 大小的阈值按 target 何时算力受限来定（这台 A40 上 8B + 0.6B 用 8 太低），让 K 本身跟着负载走，以及按行数在 varlen 和 pad 之间自动选。
-- 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：温度采样下接受率更高，要多存 `(B, k, V)` 的 q。
+- 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：已做（见上），A40 数字在排。
 - EAGLE-3 草稿头（可选）。
 - ngram 索引在 CPU 上：长 prompt 第一次 decode 要建索引，每个 token 4 次字典写入。
 
 ## 面试时可以讲的取舍
 
-- 为什么 one-hot 提议下拒绝采样是精确的：接受概率 `min(1, p/q)` 在 q 是 one-hot 时就是 `p(d)`；残差 `max(0, p-q)` 就是把 d 的概率置零。任何只依赖上下文的确定性猜法都满足这个条件。
+- 为什么 one-hot 提议下拒绝采样是精确的：接受概率 `min(1, p/q)` 在 q 是 one-hot 时就是 `p(d)`；残差 `max(0, p-q)` 就是把 d 的概率置零。任何只依赖上下文的确定性猜法都满足这个条件。 反过来，有草稿模型时按 q 采样再按 `min(1, p/q)` 验证，接受率从 `p(argmax)` 升到 `Σ min(p, q)`，输出分布不变——"精确"和"接受率"是两回事，one-hot 只是把后者放弃了。
 - 为什么 batch 里所有序列都是 k+1 个 query：形状统一才能用 `flash_attn_with_kvcache` 和 CUDA graph。代价是没猜中的序列也算 k+1 个位置；vLLM 用 varlen 注意力支持每条序列草稿数不同。后来加的 `speculative_per_sequence` 就是这条路，A40 上量完的结论是在这个组合上不值：读权重为主的 decode 里多几行接近免费，砍掉 chat 一半的位置最多省两个点，而 ragged 步要么丢 CUDA graph（batch 8 上值 25%）要么（补空行）算得和不砍一样多。能说清"为什么没赢、上限是多少、要赢还缺什么"比一个赢了的数字更有用。
 - 为什么不回收多分配的块：下一步写的位置从 `L+a` 开始，到 `L+a+k` 结束，需要的块数不会少于这一步，回收了马上又要分配。
 - 什么时候有用：decode 受内存带宽限制（小 batch、大模型）而且输出复述输入的时候。随机文本或大 batch 下会变慢，这是 benchmark 里要老实展示的。
