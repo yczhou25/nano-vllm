@@ -23,7 +23,7 @@ from nanovllm.engine.llm_engine import LLMEngine
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence
-from nanovllm.layers.sampler import RejectionSampler, accepted_token_ids
+from nanovllm.layers.sampler import DraftSampler, RejectionSampler, accepted_token_ids
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.context import get_context, set_context, reset_context
 
@@ -60,8 +60,9 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
     runner.draft_inputs = None
     runner.draft_layout = runner.sampler_layout = None
     runner.ragged_mode = "varlen"
-    runner.sampled_drafts = True    # a draft model samples its drafts and keeps their distributions (see propose)
-    runner.draft_probs = None
+    runner.sampled_drafts = True    # a draft model samples its drafts and keeps their logits (see propose)
+    runner.draft_logits = None
+    runner.draft_sampler = DraftSampler()
     runner.graphs = runner.draft_graphs = runner.graph_pool = None    # no CUDA graphs: forward runs eagerly
     return runner
 
@@ -359,18 +360,18 @@ class FakeModel:
         temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32)
         temperatures = self.runner.draft_temperatures(seqs, temperatures)    # None for a greedy batch, as run/run_async pass it
         ids = self.runner.propose(torch.tensor(meta["input_ids"], dtype=torch.int64), torch.tensor(meta["positions"], dtype=torch.int64), temperatures).tolist()
-        draft_probs = self.runner.draft_probs
+        draft_logits = self.runner.draft_logits
         if self.runner.sampled_drafts and temperatures is not None:
-            # The distributions the drafts were sampled from, one row per sequence and draft
-            # position, each (the fake draft is certain of its token) peaking at the draft.
-            if draft_probs is None or tuple(draft_probs.shape) != (len(seqs), max(num_drafts), VOCAB):
-                raise Violation(f"draft_probs {None if draft_probs is None else tuple(draft_probs.shape)} for {len(seqs)} seqs and {max(num_drafts)} drafts")
-            peaks = draft_probs.argmax(dim=-1).tolist()
+            # The logits the drafts were sampled from, one row per sequence and draft position,
+            # each (the fake draft is certain of its token) peaking at the draft.
+            if draft_logits is None or tuple(draft_logits.shape) != (len(seqs), max(num_drafts), VOCAB):
+                raise Violation(f"draft_logits {None if draft_logits is None else tuple(draft_logits.shape)} for {len(seqs)} seqs and {max(num_drafts)} drafts")
+            peaks = draft_logits.argmax(dim=-1).tolist()
             for i, seq in enumerate(seqs):
                 if peaks[i][:num_drafts[i]] != draft_model.drafts[i]:
-                    raise Violation(f"seq {seq.seq_id}: draft_probs peak at {peaks[i][:num_drafts[i]]}, drafts {draft_model.drafts[i]}")
-        elif draft_probs is not None:
-            raise Violation("draft_probs set without sampled drafts" if not self.runner.sampled_drafts else "draft_probs set for a greedy batch")
+                    raise Violation(f"seq {seq.seq_id}: draft_logits peak at {peaks[i][:num_drafts[i]]}, drafts {draft_model.drafts[i]}")
+        elif draft_logits is not None:
+            raise Violation("draft_logits set without sampled drafts" if not self.runner.sampled_drafts else "draft_logits set for a greedy batch")
         c = get_context()
         if c.is_prefill or c.context_lens.tolist() != meta["context_lens"] or c.slot_mapping.tolist() != meta["slot_mapping"]:
             raise Violation("propose did not restore the target's context")
@@ -547,13 +548,13 @@ class FakeModel:
         logits[torch.arange(n), torch.tensor(row_targets)] = 0.0
         temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=DEVICE)
         ids = torch.tensor(ids, dtype=torch.int64, device=DEVICE)
-        draft_probs = self.runner.draft_probs.to(DEVICE) if self.runner.draft_probs is not None else None    # one-hot-like: the sampler's q path must agree with the one-hot path
+        draft_logits = self.runner.draft_logits.to(DEVICE) if self.runner.draft_logits is not None else None    # one-hot-like: the sampler's q path must agree with the one-hot path
         if ragged:
             token_index, _, num_drafts = ModelRunner.ragged_layout([seq_q - 1 for seq_q in qs], pad)
             token_index, num_drafts = token_index.to(DEVICE), num_drafts.to(DEVICE)
-            token_ids = self.rejection_sampler(logits, temperatures, ids[token_index[:, 1:]], token_index, num_drafts, draft_probs)
+            token_ids = self.rejection_sampler(logits, temperatures, ids[token_index[:, 1:]], token_index, num_drafts, draft_logits)
         else:
-            token_ids = self.rejection_sampler(logits, temperatures, ids.view(len(seqs), q)[:, 1:], draft_probs=draft_probs)
+            token_ids = self.rejection_sampler(logits, temperatures, ids.view(len(seqs), q)[:, 1:], draft_logits=draft_logits)
         token_ids = accepted_token_ids(token_ids.tolist())
         for i, seq in enumerate(seqs):
             accepted = next(j for j in range(qs[i]) if j == qs[i] - 1 or all_drafts[i][j] != targets[i][j])

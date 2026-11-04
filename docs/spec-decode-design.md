@@ -490,16 +490,16 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 
 ### 做法
 
-- **采样草稿（`sample_drafts`，`ModelRunner.propose` 里）**：草稿模型每一步的 logits 按序列各自的温度算 `q = softmax(logits / T)`，用 Gumbel 技巧（`probs / Exp(1)` 取 argmax，和 `Sampler` 一样）采一个 token；温度 0 的序列仍取 argmax。q 存进 `draft_probs`，形状 `(B, k, V)`，float32（batch 32、k=4、Qwen3 的 15 万词表是 78 MB，每步分配一次）。采样在 CUDA graph 之外（graph 只抓草稿模型的 forward），所以不碰 graph 里的随机数状态。TP 下只在 rank 0 采，token 照旧广播，q 只有 rank 0 要。整个 batch 都是贪心（T=0）时 `run`/`run_async` 不把温度传给 `propose`（`draft_temperatures`），这一步就不算 softmax 也不存 q：贪心行的草稿本来就是 argmax，采样器验证贪心行也不读 q，结果一个 token 都不变，只省掉作业 244661 里量到的每步 2 ms（batch 32 下 3%）。
-- **验证（`RejectionSampler`）**：多一个可选参数 `draft_probs`。接受概率 `p(d_j) / q_j(d_j)`（和 `rand` 比，大于 1 就是必收）；被拒那一位的残差 `max(0, p - q_j)`，`torch.where` 按"真的拒了"（不是全收、也不是 ragged 的补位）选残差还是 p；残差全零（p 和 q 完全相同，理论上不会拒）时回退到 p。贪心行不看 q，照旧只收 argmax。`draft_probs=None` 走原来的 one-hot 路径（n-gram、argmax 草稿）。ragged batch 的 `token_index` 分支一样接 q：q 按序列和位，补位不读。
+- **采样草稿（`DraftSampler`，`ModelRunner.propose` 里）**：草稿模型每一步的 logits 按序列各自的温度采一个 token，Gumbel-max 直接做在 logits 上（`argmax(logits / T − log Exp(1))`，和先算 softmax 再 `probs / Exp(1)` 取 argmax 是同一个分布，少两遍 (B, V) 的读写）；温度 0 的序列仍取 argmax。存下来的不是 q 而是这一步的 logits 本身，bf16、形状 `(B, k, V)`（batch 32、k=4、Qwen3 的 15 万词表是 39 MB，每步分配一次），q 在采样器里按同样的温度算。采样在 CUDA graph 之外（graph 只抓草稿模型的 forward），所以不碰 graph 里的随机数状态；`DraftSampler` 和两个采样器一样 `torch.compile(dynamic=True)`，在 `warmup_samplers` 里按 batch 8 和 1 预热。（第一版 9b5aa91 是 eager 的 `sample_drafts`：float32 的 softmax、噪声、相除、argmax，q 存成 float32 的 `draft_probs`；A40 上量出每步 2–3 ms，见实测，2026-11-04 改成现在这样。）TP 下只在 rank 0 采，token 照旧广播，q 只有 rank 0 要。整个 batch 都是贪心（T=0）时 `run`/`run_async` 不把温度传给 `propose`（`draft_temperatures`），这一步就不算 softmax 也不存 q：贪心行的草稿本来就是 argmax，采样器验证贪心行也不读 q，结果一个 token 都不变，只省掉作业 244661 里量到的每步 2 ms（batch 32 下 3%）。
+- **验证（`RejectionSampler`）**：多一个可选参数 `draft_logits`。`q_j(d_j)` 从草稿 logits 算：和 target 的 `p(d_j)` 一样走 log-sum-exp（`log q = logit_j[d_j]/T − logsumexp(logits_j/T)`），接受概率 `exp(log p − log q)`（和 `rand` 比，大于 1 就是必收），都在编译的图里，(B, k, V) 的 bf16 只读一遍；被拒那一位的残差 `max(0, p - softmax(logits_j/T))`，只对那一行算 softmax，`torch.where` 按"真的拒了"（不是全收、也不是 ragged 的补位）选残差还是 p；残差全零（p 和 q 完全相同，理论上不会拒）时回退到 p。贪心行不看 q，照旧只收 argmax。`draft_probs=None` 走原来的 one-hot 路径（n-gram、argmax 草稿）。ragged batch 的 `token_index` 分支一样接 q：q 按序列和位，补位不读。
 - **异步调度**：q 和草稿在同一步里产生、同一步里消费（`run_async` 里 `propose` 之后就是 `sample`），不跨步，所以在途 token 的机制一个字不改。
-- 预热：`warmup_samplers` 对 `draft_probs` 分支（统一和 ragged）各编一次；bench 加 `--greedy-drafts`，行里多一个 `sampled_drafts=` 字段。
+- 预热：`warmup_samplers` 对 `draft_logits` 分支（统一和 ragged）各编一次，`DraftSampler` 按 batch 8 和 1 编一次；bench 加 `--greedy-drafts`，行里多一个 `sampled_drafts=` 字段。CPU 上照 233732 的方法验过：预热之后，batch 1–32、k 1–4、三种温度、五种 ragged 布局的草稿采样和验证都不再编译（12 张图，预热前后不变）。
 
 ### 正确性验证（CPU）
 
-- `tests/test_sampler.py`：`sample_drafts` 的频率等于 `softmax(logits/T)`、返回的 q 就是它、贪心行取 argmax；**核心用例**：三个位置各一个 target 分布和一个不同的草稿分布（词表 6，T ∈ {0.7, 1, 1.5}），10 万个 batch，草稿从 q 采，跑真实的采样器——每个位置上输出 token 的频率等于 target 分布（误差 < 0.012），第 j 位的接受率等于 `Σ min(p_j, q_j)`，被拒之后的 token 从不等于被拒的草稿；one-hot 的 q 和 `None` 路径在相同随机数下收同样的草稿、重采的 token 99.9% 相同；贪心行传不传 q 结果逐位相同。
+- `tests/test_sampler.py`：`DraftSampler` 的频率等于 `softmax(logits/T)`、贪心行取 argmax、近 one-hot 的行必取峰值；**核心用例**：三个位置各一个 target 分布和一个不同的草稿分布（词表 6，T ∈ {0.7, 1, 1.5}），10 万个 batch，草稿从 q 采，跑真实的采样器——每个位置上输出 token 的频率等于 target 分布（误差 < 0.012），第 j 位的接受率等于 `Σ min(p_j, q_j)`，被拒之后的 token 从不等于被拒的草稿；one-hot 的 q（logits 峰值 0、其余 −1e4，float32 下 softmax 严格 one-hot）和 `None` 路径在相同随机数下收同样的草稿、重采的 token 99.9% 相同；贪心行传不传 q 结果逐位相同；草稿 logits 用 bf16 传（GPU 上的真实情形）输出仍是 target 分布。
 - `tests/test_ragged_sampler.py`：ragged batch（一条两个草稿、一条没有）上同样的分布检验。
-- 模拟器：`_propose` 把序列温度传给真实的 `propose`，核对 `draft_probs` 的形状 `(B, k_max, V)` 和每行的峰值等于那条序列的草稿（假草稿模型给自己的 token 一个确定的 one-hot logits，采样结果和 argmax 一致，所以其余检查原样有效）；采样器调用带上 q，随机用例里 70% 开采样。所有既有检查（KV、哈希块、输出等于参考）照旧。
+- 模拟器：`_propose` 把序列温度传给真实的 `propose`（整个 batch 贪心时像 `run` 一样传 `None`，并核对这时没有存 logits），核对 `draft_logits` 的形状 `(B, k_max, V)` 和每行的峰值等于那条序列的草稿（假草稿模型给自己的 token 一个确定的 one-hot logits，采样结果和 argmax 一致，所以其余检查原样有效）；采样器调用带上 q，随机用例里 70% 开采样。所有既有检查（KV、哈希块、输出等于参考）照旧。
 - 变异（8 种，分布检验全抓到 7 种）：
 
 | 注入的 bug | 结果 |
@@ -512,6 +512,22 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 | 残差不归一化 | 等价变异：Gumbel 采样对缩放不敏感，不是 bug |
 | 草稿采样不除温度 | 抓到（`sample_drafts` 的频率用例） |
 | q 按温度算、草稿却取 argmax | 抓到 |
+
+q 收进采样器之后（2026-11-04）再注入 11 种，对 7 个分布用例（`test_sampler` 的三个温度、bf16 草稿 logits、`DraftSampler` 频率、one-hot 对照，`test_ragged_sampler` 的 ragged 分布）：
+
+| 注入的 bug | 失败的用例数（共 7） |
+|---|---|
+| 按 p 接受而不是 p/q | 5 |
+| q 的归一化项不除温度 | 2（T=1 的用例看不出，T=0.7 / 1.5 抓到） |
+| q 在草稿处的 logit 不除温度 | 2 |
+| 残差不 clamp | 5 |
+| 残差用 p（不减 q） | 6 |
+| 残差用前一位的 q | 6 |
+| 残差里的 q 不除温度 | 2 |
+| 全收之后也用残差 | 6 |
+| 草稿采样不除温度 | 1（`DraftSampler` 的频率用例） |
+| 草稿采样用均匀噪声代替 Gumbel | 1 |
+| 草稿采样返回 argmax | 1 |
 
 ### 预期
 
@@ -537,7 +553,7 @@ batch 8：基线 250.2 / 250.2，关草稿 250.1，开关 235.8（×0.94）。
 - **接受率涨了，但没有预期的那么多**：chat 上每一位都涨 0.02–0.04（第 1 位 0.63 → 0.66，第 4 位 0.21 → 0.23），整体 0.39 → 0.42，不是预期的 0.6。预期算错在把 `Σ min(p, q)` 当成了"q 像 p"，0.6B 和 8B 在开放问答上的分布差得远，重合只比 argmax 的信心多这么一点。按位接受率加起来，每步平均多收的 token 从 1.58 升到 1.69（+7%），步数少 9%（520 → 474）。
 - **代价比预期大**：batch 32 上每步从 58.2 ms 涨到 61.0 ms（+2.8 ms，5%），batch 8 +1.0 ms，batch 1 +0.4 ms；T=0 对照行接受率、token 数、步数三者完全相同（1 个 token 都没变，贪心路径验证成立），但也多付 1.9 ms。来源就是做法里那个 `(B, k, V)` float32 的 q：`sample_drafts` 在 CUDA graph 之外，对 batch 32 的 `(32, 151936)` 做 float 转换、除温度、softmax、指数噪声、相除、argmax，再拷进 `draft_probs`，每个草稿步约 330 MB 的读写，4 步加起来 1.3 GB，A40 的带宽下就是 2 ms。预期里写的"1% 以内"只算了存 q，没算这一串 eager 算子。所以 chat batch 32 上 +7% 的 token 只落成 +5% 的吞吐，batch 1 上 +3%；edit 上接受率本来 0.87，采样没得涨（0.868 → 0.871），batch 1 持平，batch 32 的 −4% 不是每步变慢（97.4 对 97.1 ms），是采样出来的回答短了（25015 对 25394 个 token，253 对 260 步），在采样的噪声里。
 - 开关 0.2 下采样草稿把 k 停在更高的位（k=4 的步 145 对 69），接受率 0.446 → 0.459，吞吐 +2%。
-- 接下来做两件事：T=0 的整 batch 跳过采样（已做，见做法）；把 q 的那一串算子收进编译的采样器——草稿步只存 bf16 的 logits（一半的字节），用 Gumbel-max 直接在 logits 上采（`argmax(logits/T + Gumbel)`，不用先算 softmax），`p/q` 和残差要的 q 在 `RejectionSampler` 里从 logits 算（和 target 的 p 一样的 log-sum-exp，编译后和现有算子融合）。预计把 2.8 ms 压到 0.5 ms 以下。
+- 接下来做两件事：T=0 的整 batch 跳过采样（已做，见做法）；把 q 的那一串算子收进编译的采样器——草稿步只存 bf16 的 logits（一半的字节），用 Gumbel-max 直接在 logits 上采（`argmax(logits/T + Gumbel)`，不用先算 softmax），`p/q` 和残差要的 q 在 `RejectionSampler` 里从 logits 算（和 target 的 p 一样的 log-sum-exp，编译后和现有算子融合）。预计把 2.8 ms 压到 0.5 ms 以下。2026-11-04 做了（做法一节已改成新写法），CPU 上分布检验照旧全过、11 种变异见下表，A40 复测脚本 `cluster/nanovllm-sampled2-a40.sbatch` 跑和 244661 一样的 23 行。
 - 重编译：日志 382 次，基线行 12、argmax 草稿行 17、采样草稿行 19（多的 2 次是 `draft_probs` 分支在 batch 8 和 1 的预热）、开关行 21 / 25，都在计时之前。这次的判断方法比 233732 更硬：每一行最后一次重编译的时间加上这一行的计时时长，再加 19–21 秒（下一个进程启动和读权重），正好是下一行第一次重编译的时间——22 对相邻行里 21 对都是这样（唯一的例外是开关采样行到 edit 基线行，多了 12 秒，来源没查），所以计时循环就从最后一次重编译（bench 计时前那条单 prompt 的预热）之后开始。
 
 ## 还没做的

@@ -115,11 +115,11 @@ def test_sampled_drafts_on_a_ragged_batch_give_the_target_distribution():
     logits.view(n, 4, 6)[:, 3] = target[2]
     input_ids = torch.zeros(4 * n, dtype=torch.int64, device=DEVICE)
     input_ids.view(n, 4)[:, 1:3] = drafts
-    draft_probs = torch.zeros(2 * n, 2, 6, device=DEVICE)
-    draft_probs[0::2] = q[:2]
+    draft_logits = torch.zeros(2 * n, 2, 6, device=DEVICE)    # the sampler computes q from these
+    draft_logits[0::2] = draft[:2]
     token_index, _, num_drafts = ModelRunner.ragged_layout([2, 0] * n)
     token_index, num_drafts = token_index.to(DEVICE), num_drafts.to(DEVICE)
-    out = RejectionSampler()(logits, torch.full((2 * n,), temperature, device=DEVICE), input_ids[token_index[:, 1:]], token_index, num_drafts, draft_probs)
+    out = RejectionSampler()(logits, torch.full((2 * n,), temperature, device=DEVICE), input_ids[token_index[:, 1:]], token_index, num_drafts, draft_logits)
     check_speculative_sampling(out[0::2], drafts, p, q, tolerance=0.015)
     without = out[1::2]
     assert (without[:, 1:] == -1).all()
