@@ -104,7 +104,7 @@ def test_sampled_rows_follow_the_target_distribution(temperature):
 def test_sampled_drafts_on_a_ragged_batch_give_the_target_distribution():
     # Exact speculative sampling through the ragged branch: the sequence with two sampled drafts
     # follows the target at every position, the one without any samples from the target directly.
-    from test_sampler import TARGET_LOGITS, DRAFT_LOGITS, check_speculative_sampling
+    from test_sampler import DRAFT_LOGITS, TARGET_LOGITS, check_speculative_sampling
     torch.manual_seed(0)
     n, temperature = 50000, 1.0
     target, draft = torch.tensor(TARGET_LOGITS, device=DEVICE), torch.tensor(DRAFT_LOGITS, device=DEVICE)

@@ -466,6 +466,14 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    @staticmethod
+    def draft_temperatures(seqs: list[Sequence], temperatures: torch.Tensor | None) -> torch.Tensor | None:
+        """The temperatures propose samples drafts at: None for a batch of greedy sequences, whose
+        drafts are the argmax either way and whose rows the sampler verifies without q, so the
+        step skips the (B, k, V) softmax and its storage (3% of a decode step at batch 32 on an
+        A40 with Qwen3-8B + 0.6B, A40 job 244661)."""
+        return temperatures if temperatures is not None and any(seq.temperature > 0 for seq in seqs) else None
+
     @torch.inference_mode()
     def forward(self, model: Qwen3ForCausalLM, graphs: dict | None, outputs: torch.Tensor | None, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         """Hidden states of input_ids, through a captured CUDA graph when there is one for this
@@ -574,7 +582,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        input_ids, logits, k = self.decode_logits(seqs, is_prefill, temperatures)
+        input_ids, logits, k = self.decode_logits(seqs, is_prefill, self.draft_temperatures(seqs, temperatures))
         token_ids = None
         if self.rank == 0:
             token_ids = self.sample(seqs, input_ids, logits, temperatures, k).tolist()
@@ -588,7 +596,7 @@ class ModelRunner:
         """Like run, but returns before the GPU finishes. The sampled tokens stay on the GPU as
         inputs for the next decode step, and are copied to the host in the background."""
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        input_ids, logits, k = self.decode_logits(seqs, is_prefill, temperatures)
+        input_ids, logits, k = self.decode_logits(seqs, is_prefill, self.draft_temperatures(seqs, temperatures))
         if self.rank == 0:
             token_ids = self.sample(seqs, input_ids, logits, temperatures, k)
         else:

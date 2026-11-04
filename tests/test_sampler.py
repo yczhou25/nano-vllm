@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from nanovllm.layers.sampler import RejectionSampler, Sampler, accepted_token_ids, sample_drafts
+from nanovllm.layers.sampler import (
+    RejectionSampler,
+    Sampler,
+    accepted_token_ids,
+    sample_drafts,
+)
 from nanovllm.sampling_params import SamplingParams
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

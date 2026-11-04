@@ -357,9 +357,10 @@ class FakeModel:
         self.runner.draft_inputs = tuple(torch.tensor(t, dtype=dtype) for t, dtype in zip(meta["draft_inputs"], meta["draft_dtypes"]))
         self.runner.draft_layout = tuple(torch.tensor(t) if t is not None else None for t in meta["draft_layout"])
         temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32)
+        temperatures = self.runner.draft_temperatures(seqs, temperatures)    # None for a greedy batch, as run/run_async pass it
         ids = self.runner.propose(torch.tensor(meta["input_ids"], dtype=torch.int64), torch.tensor(meta["positions"], dtype=torch.int64), temperatures).tolist()
         draft_probs = self.runner.draft_probs
-        if self.runner.sampled_drafts:
+        if self.runner.sampled_drafts and temperatures is not None:
             # The distributions the drafts were sampled from, one row per sequence and draft
             # position, each (the fake draft is certain of its token) peaking at the draft.
             if draft_probs is None or tuple(draft_probs.shape) != (len(seqs), max(num_drafts), VOCAB):
@@ -369,7 +370,7 @@ class FakeModel:
                 if peaks[i][:num_drafts[i]] != draft_model.drafts[i]:
                     raise Violation(f"seq {seq.seq_id}: draft_probs peak at {peaks[i][:num_drafts[i]]}, drafts {draft_model.drafts[i]}")
         elif draft_probs is not None:
-            raise Violation("draft_probs set without sampled drafts")
+            raise Violation("draft_probs set without sampled drafts" if not self.runner.sampled_drafts else "draft_probs set for a greedy batch")
         c = get_context()
         if c.is_prefill or c.context_lens.tolist() != meta["context_lens"] or c.slot_mapping.tolist() != meta["slot_mapping"]:
             raise Violation("propose did not restore the target's context")
