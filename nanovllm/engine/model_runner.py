@@ -45,6 +45,7 @@ class ModelRunner:
         self.ragged_mode = config.speculative_ragged    # how a ragged batch runs: "varlen" or "pad" (see prepare_decode)
         self.sampled_drafts = config.speculative_sampled_drafts    # a draft model samples its drafts (see propose), with the distributions kept for the sampler
         self.draft_logits = None      # (batch_size, k, vocab_size): the draft model's logits each draft was sampled from, in a step that sampled them
+        self.draft_log_norms = None   # (batch_size, k): their log-sum-exp at the temperature (DraftSampler), with which the sampler reads q
         self.draft_layout = None      # where each sequence's drafts go in the decode inputs (see ragged_layout)
         self.sampler_layout = None    # the same for RejectionSampler, in a ragged batch only
         self.graphs = None            # CUDA graphs by decode batch size, once captured (see capture_cudagraph)
@@ -180,7 +181,7 @@ class ModelRunner:
                         self.rejection_sampler(logits, temperatures, input_ids[:, 1:])
                         if sampled:
                             draft_logits = torch.zeros(batch_size, q - 1, hf_config.vocab_size, dtype=hf_config.dtype, device="cuda")
-                            self.rejection_sampler(logits, temperatures, input_ids[:, 1:], draft_logits=draft_logits)
+                            self.rejection_sampler(logits, temperatures, input_ids[:, 1:], draft_logits=draft_logits, draft_log_norms=torch.zeros(batch_size, q - 1, device="cuda"))
             if self.config.speculative_per_sequence:
                 # Ragged batches (at least two sequences, every number of drafts up to K) take the
                 # sampler's other branch, with the drafts gathered by the batch's layout.
@@ -196,7 +197,7 @@ class ModelRunner:
                     self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts)
                     if sampled:
                         draft_logits = torch.zeros(batch_size, k, hf_config.vocab_size, dtype=hf_config.dtype, device="cuda")
-                        self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts, draft_logits)
+                        self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts, draft_logits, torch.zeros(batch_size, k, device="cuda"))
 
     def kv_cache_block_bytes(self, hf_config) -> int:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -512,8 +513,9 @@ class ModelRunner:
         """Run the draft model k times and write its tokens into the draft columns of input_ids
         (one row of batch_size * (k + 1)). With speculative_sampled_drafts and the sequences'
         temperatures (rank 0), each draft is sampled from the draft's distribution at the
-        sequence's temperature (DraftSampler) and the logits it came from are kept in
-        draft_logits for RejectionSampler, which computes q from them and accepts with min(1, p/q)
+        sequence's temperature (DraftSampler) and the logits it came from, with their log-sum-exp,
+        are kept in draft_logits and draft_log_norms for RejectionSampler, which reads q from
+        them and accepts with min(1, p/q)
         (exact speculative sampling); otherwise the drafts are the draft's argmax, one-hot
         proposals the sampler accepts with p. The first step scores the
         tokens the draft KV cache lacks (see prepare_decode_with_draft_model) and proposes from the
@@ -528,7 +530,7 @@ class ModelRunner:
         k = token_index.size(1) - 1
         slot_mapping = context.slot_mapping
         sampling = self.sampled_drafts and temperatures is not None and self.rank == 0
-        self.draft_logits = None
+        self.draft_logits = self.draft_log_norms = None
         for i in range(k):
             if i == 0:
                 q, step_positions, step_slots = m, catchup_positions, catchup_slots
@@ -548,10 +550,12 @@ class ModelRunner:
             hidden_states = self.forward(self.draft_model, graphs, outputs, tokens.reshape(-1), step_positions.reshape(-1), False)
             logits = self.draft_model.compute_logits(hidden_states[q - 1::q])
             if sampling:
-                tokens = self.draft_sampler(logits, temperatures)
+                tokens, log_norms = self.draft_sampler(logits, temperatures)
                 if i == 0:
                     self.draft_logits = torch.empty((bs, k) + logits.shape[1:], dtype=logits.dtype, device=logits.device)
+                    self.draft_log_norms = torch.empty((bs, k), dtype=log_norms.dtype, device=logits.device)
                 self.draft_logits[:, i] = logits
+                self.draft_log_norms[:, i] = log_norms
             else:
                 tokens = logits.argmax(dim=-1) if self.rank == 0 else torch.empty(bs, dtype=torch.int64, device="cuda")
             if self.world_size > 1:
@@ -565,7 +569,7 @@ class ModelRunner:
         sequence has: with speculative_per_sequence a batch can be ragged, see ragged_layout)."""
         k = 0 if is_prefill else max(seq.num_scheduled_tokens for seq in seqs) - 1
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        self.draft_logits = None
+        self.draft_logits = self.draft_log_norms = None
         if self.draft_model is not None and k:
             input_ids = self.propose(input_ids, positions, temperatures)
         n = input_ids.size(0) if get_context().cu_seqlens_q is None else sum(seq.num_scheduled_tokens for seq in seqs)    # a varlen ragged batch's inputs end with a scratch row
@@ -580,9 +584,9 @@ class ModelRunner:
         if not k:
             return self.sampler(logits, temperatures)
         if self.sampler_layout is None:
-            return self.rejection_sampler(logits, temperatures, input_ids[:len(seqs) * (k + 1)].view(len(seqs), k + 1)[:, 1:], draft_logits=self.draft_logits)
+            return self.rejection_sampler(logits, temperatures, input_ids[:len(seqs) * (k + 1)].view(len(seqs), k + 1)[:, 1:], draft_logits=self.draft_logits, draft_log_norms=self.draft_log_norms)
         token_index, num_drafts = self.sampler_layout
-        return self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts, self.draft_logits)
+        return self.rejection_sampler(logits, temperatures, input_ids[token_index[:, 1:]], token_index, num_drafts, self.draft_logits, self.draft_log_norms)
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:

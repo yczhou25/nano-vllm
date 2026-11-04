@@ -89,14 +89,20 @@ def test_draft_sampler_follows_the_draft_distribution():
     row = torch.tensor([2.0, 1.0, 0.5, 0.0, -1.0], device=DEVICE)
     temperatures = torch.full((n,), 0.7, device=DEVICE)
     temperatures[0::2] = 0
-    tokens = DraftSampler()(row.repeat(n, 1), temperatures)
+    tokens, log_norms = DraftSampler()(row.repeat(n, 1), temperatures)
     assert (tokens[0::2] == 0).all()
     expected = torch.softmax(row / 0.7, dim=-1)
     freq = torch.bincount(tokens[1::2], minlength=5).float() / (n // 2)
     assert (freq - expected).abs().max().item() < 0.015
+    assert torch.allclose(log_norms[1::2], torch.logsumexp(row / 0.7, dim=-1).expand(n // 2), atol=1e-5)    # q's normaliser, for the sampler
     hot = torch.full((n, 5), -1000.0, device=DEVICE)    # a near-one-hot row samples its peak
     hot[:, 3] = 0.0
-    assert (DraftSampler()(hot, temperatures) == 3).all()
+    assert (DraftSampler()(hot, temperatures)[0] == 3).all()
+
+
+def log_norms_of(draft_logits, temperature):
+    """What DraftSampler hands the sampler with the logits: logsumexp(logits / T) per row."""
+    return torch.logsumexp(draft_logits.float() / temperature, dim=-1)
 
 
 TARGET_LOGITS = [[2.0, 1.5, 0.5, 0.0, -1.0, -2.0],
@@ -139,8 +145,8 @@ def test_sampled_drafts_give_the_target_distribution(temperature):
     target, draft = torch.tensor(TARGET_LOGITS, device=DEVICE), torch.tensor(DRAFT_LOGITS, device=DEVICE)
     p, q = torch.softmax(target / temperature, dim=-1), torch.softmax(draft / temperature, dim=-1)
     drafts = torch.stack([torch.multinomial(q[j], n, replacement=True) for j in range(2)], dim=1)    # two drafts, three positions
-    draft_logits = draft[:2].unsqueeze(0).expand(n, -1, -1).contiguous()    # q is computed inside the sampler
-    out = RejectionSampler()(target.repeat(n, 1), torch.full((n,), temperature, device=DEVICE), drafts, draft_logits=draft_logits)
+    draft_logits = draft[:2].unsqueeze(0).expand(n, -1, -1).contiguous()    # q is read from these inside the sampler
+    out = RejectionSampler()(target.repeat(n, 1), torch.full((n,), temperature, device=DEVICE), drafts, draft_logits=draft_logits, draft_log_norms=log_norms_of(draft_logits, temperature))
     check_speculative_sampling(out, drafts, p, q)
 
 
@@ -156,7 +162,7 @@ def test_one_hot_draft_logits_match_the_one_hot_path():
     torch.manual_seed(1)
     without = RejectionSampler()(target.repeat(n, 1), temperatures, drafts)
     torch.manual_seed(1)
-    with_q = RejectionSampler()(target.repeat(n, 1), temperatures, drafts, draft_logits=draft_logits)
+    with_q = RejectionSampler()(target.repeat(n, 1), temperatures, drafts, draft_logits=draft_logits, draft_log_norms=log_norms_of(draft_logits, 1.0))
     accepted = (without != -1).sum(dim=1)
     assert torch.equal(accepted, (with_q != -1).sum(dim=1))    # the same drafts accepted (the same random draws)
     assert (without == with_q).all(dim=1).float().mean().item() > 0.999    # the residual sample too, up to rounding
@@ -169,7 +175,7 @@ def test_greedy_rows_ignore_draft_logits():
     drafts[0] = logits.view(4, 3, -1)[0, :2].argmax(dim=-1)    # all accepted
     draft_logits = torch.randn(4, 2, 50, device=DEVICE)
     temperatures = torch.zeros(4, device=DEVICE)
-    assert torch.equal(RejectionSampler()(logits, temperatures, drafts), RejectionSampler()(logits, temperatures, drafts, draft_logits=draft_logits))
+    assert torch.equal(RejectionSampler()(logits, temperatures, drafts), RejectionSampler()(logits, temperatures, drafts, draft_logits=draft_logits, draft_log_norms=torch.randn(4, 2, device=DEVICE)))
 
 
 def test_bf16_draft_logits_give_the_target_distribution():
@@ -181,5 +187,6 @@ def test_bf16_draft_logits_give_the_target_distribution():
     draft_logits = draft[:2].to(torch.bfloat16)
     p, q = torch.softmax(target / temperature, dim=-1), torch.softmax(draft_logits.float() / temperature, dim=-1)
     drafts = torch.stack([torch.multinomial(q[j], n, replacement=True) for j in range(2)], dim=1)
-    out = RejectionSampler()(target.repeat(n, 1), torch.full((n,), temperature, device=DEVICE), drafts, draft_logits=draft_logits.unsqueeze(0).expand(n, -1, -1).contiguous())
+    draft_logits = draft_logits.unsqueeze(0).expand(n, -1, -1).contiguous()
+    out = RejectionSampler()(target.repeat(n, 1), torch.full((n,), temperature, device=DEVICE), drafts, draft_logits=draft_logits, draft_log_norms=log_norms_of(draft_logits, temperature))
     check_speculative_sampling(out, drafts, p, torch.softmax(draft / temperature, dim=-1))

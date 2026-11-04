@@ -61,7 +61,7 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
     runner.draft_layout = runner.sampler_layout = None
     runner.ragged_mode = "varlen"
     runner.sampled_drafts = True    # a draft model samples its drafts and keeps their logits (see propose)
-    runner.draft_logits = None
+    runner.draft_logits = runner.draft_log_norms = None
     runner.draft_sampler = DraftSampler()
     runner.graphs = runner.draft_graphs = runner.graph_pool = None    # no CUDA graphs: forward runs eagerly
     return runner
@@ -366,11 +366,14 @@ class FakeModel:
             # each (the fake draft is certain of its token) peaking at the draft.
             if draft_logits is None or tuple(draft_logits.shape) != (len(seqs), max(num_drafts), VOCAB):
                 raise Violation(f"draft_logits {None if draft_logits is None else tuple(draft_logits.shape)} for {len(seqs)} seqs and {max(num_drafts)} drafts")
+            log_norms = self.runner.draft_log_norms
+            if log_norms is None or tuple(log_norms.shape) != (len(seqs), max(num_drafts)) or not torch.allclose(log_norms, torch.logsumexp(draft_logits.float() / torch.tensor([max(seq.temperature, 1e-10) for seq in seqs]).view(-1, 1, 1), dim=-1)):
+                raise Violation("draft_log_norms missing or not the log-sum-exp of draft_logits at the temperatures")
             peaks = draft_logits.argmax(dim=-1).tolist()
             for i, seq in enumerate(seqs):
                 if peaks[i][:num_drafts[i]] != draft_model.drafts[i]:
                     raise Violation(f"seq {seq.seq_id}: draft_logits peak at {peaks[i][:num_drafts[i]]}, drafts {draft_model.drafts[i]}")
-        elif draft_logits is not None:
+        elif draft_logits is not None or self.runner.draft_log_norms is not None:
             raise Violation("draft_logits set without sampled drafts" if not self.runner.sampled_drafts else "draft_logits set for a greedy batch")
         c = get_context()
         if c.is_prefill or c.context_lens.tolist() != meta["context_lens"] or c.slot_mapping.tolist() != meta["slot_mapping"]:
@@ -549,12 +552,13 @@ class FakeModel:
         temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=DEVICE)
         ids = torch.tensor(ids, dtype=torch.int64, device=DEVICE)
         draft_logits = self.runner.draft_logits.to(DEVICE) if self.runner.draft_logits is not None else None    # one-hot-like: the sampler's q path must agree with the one-hot path
+        draft_log_norms = self.runner.draft_log_norms.to(DEVICE) if draft_logits is not None else None
         if ragged:
             token_index, _, num_drafts = ModelRunner.ragged_layout([seq_q - 1 for seq_q in qs], pad)
             token_index, num_drafts = token_index.to(DEVICE), num_drafts.to(DEVICE)
-            token_ids = self.rejection_sampler(logits, temperatures, ids[token_index[:, 1:]], token_index, num_drafts, draft_logits)
+            token_ids = self.rejection_sampler(logits, temperatures, ids[token_index[:, 1:]], token_index, num_drafts, draft_logits, draft_log_norms)
         else:
-            token_ids = self.rejection_sampler(logits, temperatures, ids.view(len(seqs), q)[:, 1:], draft_logits=draft_logits)
+            token_ids = self.rejection_sampler(logits, temperatures, ids.view(len(seqs), q)[:, 1:], draft_logits=draft_logits, draft_log_norms=draft_log_norms)
         token_ids = accepted_token_ids(token_ids.tolist())
         for i, seq in enumerate(seqs):
             accepted = next(j for j in range(qs[i]) if j == qs[i] - 1 or all_drafts[i][j] != targets[i][j])

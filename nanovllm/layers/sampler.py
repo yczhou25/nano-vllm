@@ -26,7 +26,7 @@ class RejectionSampler(nn.Module):
     @torch.compile(dynamic=True)
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, draft_token_ids: torch.Tensor,
                 token_index: torch.Tensor | None = None, num_drafts: torch.Tensor | None = None,
-                draft_logits: torch.Tensor | None = None):
+                draft_logits: torch.Tensor | None = None, draft_log_norms: torch.Tensor | None = None):
         """logits: (batch_size * (k + 1), vocab_size); draft_token_ids: (batch_size, k).
         Returns (batch_size, k + 1) token ids: the accepted drafts, one sampled token, then -1.
 
@@ -37,9 +37,11 @@ class RejectionSampler(nn.Module):
         with each k_i: the padded positions count as rejected.
 
         draft_logits (batch_size, k, vocab_size): the draft model's logits each draft was sampled
-        from (DraftSampler), in the model's dtype; q_j = softmax(draft_logits_j / temperature) is
-        computed here, inside the compiled graph, for the exact speculative sampling of Leviathan
-        et al.: draft j is accepted with probability min(1, p(d_j) / q_j(d_j)), and the token after
+        from, in the model's dtype, and draft_log_norms (batch_size, k): their log-sum-exp at the
+        temperature, both from DraftSampler; q_j = exp(draft_logits_j / temperature - log_norm_j)
+        is then a pointwise read of the logits here (no reduction over them in this graph: the
+        k=1 graph of a logsumexp over them tripped an Inductor fusion assertion on the GPU, A40
+        job 245130), for the exact speculative sampling of Leviathan et al.: draft j is accepted with probability min(1, p(d_j) / q_j(d_j)), and the token after
         a rejected draft is drawn from the residual norm(max(0, p - q_j)). None means one-hot
         drafts (the argmax of the draft model, the n-gram proposer): accept with p(d_j), and the
         residual is p with d_j removed. Greedy rows (temperature 0) accept a draft only if it is
@@ -57,8 +59,7 @@ class RejectionSampler(nn.Module):
         log_target_probs = target_at_drafts / temperatures - log_norms    # log p(d_j)
         if draft_logits is not None:
             draft_at_drafts = draft_logits.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).float()
-            q_log_norms = torch.logsumexp(draft_logits.float() / temperatures.unsqueeze(dim=-1), dim=-1)
-            accept_probs = torch.exp(log_target_probs - (draft_at_drafts / temperatures - q_log_norms))    # p / q
+            accept_probs = torch.exp(log_target_probs - (draft_at_drafts / temperatures - draft_log_norms))    # p / q
         else:
             accept_probs = torch.exp(log_target_probs)
         accepted = torch.where(greedy.unsqueeze(dim=1), logits[:, :k].argmax(dim=-1) == draft_token_ids,
@@ -79,7 +80,8 @@ class RejectionSampler(nn.Module):
             probs = torch.softmax(masked_logits.div_(temperatures), dim=-1)
         else:
             probs = torch.softmax(last_logits / temperatures, dim=-1)
-            residual = (probs - torch.softmax(draft_logits[rows, rejected_at].float() / temperatures, dim=-1)).clamp_min(0)
+            q_row = torch.exp(draft_logits[rows, rejected_at].float() / temperatures - draft_log_norms[rows, rejected_at].unsqueeze(dim=1))    # q_j
+            residual = (probs - q_row).clamp_min(0)
             norm = residual.sum(dim=-1, keepdim=True)
             probs = torch.where(was_rejected & (norm > 0), residual / norm, probs)
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
@@ -92,16 +94,18 @@ class RejectionSampler(nn.Module):
 class DraftSampler(nn.Module):
     """A draft model's proposals from its logits (batch_size, vocab_size): a sample from
     softmax(logits / temperature) per sequence, drawn by the Gumbel-max trick on the logits
-    themselves (argmax(logits / T - log E), E ~ Exp(1)), so no softmax is computed or stored;
-    RejectionSampler reads q from the same logits. A greedy sequence (temperature 0) drafts the
-    argmax (the sampler does not read its q). Compiled like the samplers, for the same reason."""
+    themselves (argmax(logits / T - log E), E ~ Exp(1)), so no softmax is computed or stored,
+    and the log-sum-exp of logits / T (batch_size,), with which RejectionSampler reads q from
+    the same logits. A greedy sequence (temperature 0) drafts the argmax (the sampler does not
+    read its q). Compiled like the samplers, for the same reason."""
 
     @torch.compile(dynamic=True)
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         greedy_tokens = logits.argmax(dim=-1)
         scaled = logits.float() / temperatures.clamp_min(1e-10).unsqueeze(dim=1)
+        log_norms = torch.logsumexp(scaled, dim=-1)
         sample_tokens = scaled.sub_(torch.empty_like(scaled).exponential_(1).clamp_min_(1e-10).log_()).argmax(dim=-1)
-        return torch.where(temperatures == 0, greedy_tokens, sample_tokens)
+        return torch.where(temperatures == 0, greedy_tokens, sample_tokens), log_norms
 
 
 def accepted_token_ids(token_ids: list[list[int]]) -> list[list[int]]:
