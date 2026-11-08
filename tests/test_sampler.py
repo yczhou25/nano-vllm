@@ -6,6 +6,9 @@ from nanovllm.layers.sampler import (
     RejectionSampler,
     Sampler,
     accepted_token_ids,
+    chunked_argmax,
+    chunked_logsumexp,
+    exponential_like,
 )
 from nanovllm.sampling_params import SamplingParams
 
@@ -190,3 +193,25 @@ def test_bf16_draft_logits_give_the_target_distribution():
     draft_logits = draft_logits.unsqueeze(0).expand(n, -1, -1).contiguous()
     out = RejectionSampler()(target.repeat(n, 1), torch.full((n,), temperature, device=DEVICE), drafts, draft_logits=draft_logits, draft_log_norms=log_norms_of(draft_logits, temperature))
     check_speculative_sampling(out, drafts, p, torch.softmax(draft / temperature, dim=-1))
+
+
+@pytest.mark.parametrize("vocab_size", [5, 6, 40, 1187, 2048, 151936 // 8])
+def test_chunked_reductions_match_the_plain_ones(vocab_size):
+    torch.manual_seed(1)
+    x = torch.randn(3, 4, vocab_size, device=DEVICE)
+    x[0, 0] = 1.0    # a row of ties: the first index, like torch.argmax
+    x[0, 1, [min(3, vocab_size - 1), vocab_size - 1]] = 100.0    # ties in two chunks
+    x[1, 2] = float("-inf")
+    assert torch.equal(chunked_argmax(x), x.argmax(dim=-1))
+    assert torch.equal(chunked_argmax(x[:, :2]), x[:, :2].argmax(dim=-1))    # a column slice, as the sampler passes
+    assert torch.equal(chunked_argmax(x[2]), x[2].argmax(dim=-1))
+    assert torch.allclose(chunked_logsumexp(x), torch.logsumexp(x, dim=-1), atol=1e-5)
+    assert torch.allclose(chunked_logsumexp(x[:, :2]), torch.logsumexp(x[:, :2], dim=-1), atol=1e-5)
+
+
+def test_exponential_like_is_exp1():
+    torch.manual_seed(2)
+    for draw in (exponential_like, torch.compile(exponential_like, dynamic=True)):
+        e = draw(torch.empty(200000, device=DEVICE))
+        assert e.min().item() > 0
+        assert abs(e.mean().item() - 1) < 0.02 and abs(e.var().item() - 1) < 0.05
