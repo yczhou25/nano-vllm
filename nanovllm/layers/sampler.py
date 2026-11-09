@@ -3,12 +3,17 @@ from torch import nn
 
 
 def _chunks(vocab_size: int) -> int:
-    """How many equal chunks chunked_argmax and chunked_logsumexp cut a vocabulary row into: the
-    largest power of two up to 128 that divides it (1 when it is odd)."""
-    chunks = 128
-    while chunks > 1 and vocab_size % chunks:
-        chunks //= 2
-    return chunks
+    """How many chunks chunked_argmax and chunked_logsumexp cut a vocabulary row into. A chunk is
+    the largest power of two up to 1024 that divides the vocabulary (Qwen3's 151936 = 2^7 * 1187:
+    128-element chunks, 1187 of them): at most 1024 so that Inductor reduces a chunk as a
+    persistent reduction, the chunk in registers and read once for every reduction over it (a max
+    and its index, the log-sum-exp's max and sum); A40 job 279567 measured 128-wide chunks of a
+    looped reduction (1187 elements, two passes over the logits) no faster than the one-block rows
+    at batch 32. A vocabulary that gives chunks under 8 elements is not chunked (1 chunk)."""
+    chunk = 1024
+    while chunk > 1 and vocab_size % chunk:
+        chunk //= 2
+    return vocab_size // chunk if chunk >= 8 else 1
 
 
 def chunked_argmax(x: torch.Tensor) -> torch.Tensor:
@@ -17,8 +22,8 @@ def chunked_argmax(x: torch.Tensor) -> torch.Tensor:
     kernel: Inductor never splits a reduction with an argmax across thread blocks
     (torch/_inductor/ir.py, Reduction.num_splits), so a one-stage argmax over a 151936-wide row
     runs one block per row; a batch of 32 kept 32 of an A40's 84 SMs busy and took 183 us per
-    call, a single sequence one SM (A40 job 278958). The first stage here has rows * 128 outputs
-    to spread over the GPU and the second reduces 128 values per row."""
+    call, a single sequence one SM (A40 job 278958). The first stage here has rows * chunks
+    outputs to spread over the GPU and the second reduces the chunk maxima of each row."""
     vocab_size = x.size(-1)
     chunks = _chunks(vocab_size)
     if chunks == 1:
