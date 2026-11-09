@@ -59,9 +59,10 @@ def test_samples_follow_softmax_across_tiles():
 
 
 def test_equal_logits_sample_uniformly():
-    rows, vocab_size = 600, 24
+    # Three tiles per row: if two tiles drew the same noise, the first of them would always win.
+    rows, vocab_size = 300, 24
     torch.manual_seed(2)
-    tokens, log_norms = fused_sample(torch.zeros(rows, vocab_size, device=DEVICE), torch.ones(rows, device=DEVICE), block=32)
+    tokens, log_norms = fused_sample(torch.zeros(rows, vocab_size, device=DEVICE), torch.ones(rows, device=DEVICE), block=8)
     counts = torch.bincount(tokens.cpu(), minlength=vocab_size).float() / rows
     assert (counts - 1 / vocab_size).abs().max() < 4.5 * (1 / vocab_size * (1 - 1 / vocab_size) / rows) ** 0.5
     assert torch.allclose(log_norms, torch.full((rows,), float(torch.log(torch.tensor(vocab_size))), device=DEVICE))
@@ -83,9 +84,13 @@ def test_samplers_dispatch_to_the_kernels_on_the_gpu_and_torch_elsewhere():
     logits = rows_of(6, 64, torch.bfloat16)
     temperatures = torch.tensor([0.0, 0.5, 0.0, 1.0, 0.0, 0.8], device=DEVICE)
     tokens, log_norms = DraftSampler()(logits, temperatures)
-    expected_tokens, expected_norms = DraftSampler().torch_forward(logits, temperatures)
+    expected_tokens, torch_norms = DraftSampler().torch_forward(logits, temperatures)
     assert torch.equal(tokens[temperatures == 0], expected_tokens[temperatures == 0])
-    assert torch.allclose(log_norms, expected_norms, rtol=1e-5, atol=1e-4)
+    # Both paths use approximate exp/log/division on the GPU (Triton's div.full and ex2/lg2.approx,
+    # Inductor's libdevice); compare each with a float64 reference rather than with each other.
+    reference = torch.logsumexp(logits.double() / temperatures.double().clamp_min(1e-10).unsqueeze(1), dim=-1)
+    assert torch.allclose(log_norms.double(), reference, rtol=1e-5, atol=1e-3), (log_norms - reference).abs().max()
+    assert torch.allclose(torch_norms.double(), reference, rtol=1e-5, atol=1e-3), (torch_norms - reference).abs().max()
     sampled = Sampler()(logits, temperatures)
     assert sampled.shape == (6,) and sampled.dtype == torch.int64
     assert torch.equal(sampled[temperatures == 0], logits.argmax(dim=-1)[temperatures == 0])

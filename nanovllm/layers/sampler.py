@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch import nn
 
@@ -78,7 +80,10 @@ if triton is not None:
         scaled = logits / temperature
         scaled_max = tl.max(scaled, axis=0)
         scaled_sum = tl.sum(tl.exp(scaled - tl.where(scaled_max == float("-inf"), 0.0, scaled_max)), axis=0)
-        uniform = tl.rand(seed, row * vocab_size + offsets)
+        # One Philox call gives four uniforms (tl.rand keeps one of them and was ~half of this kernel, A40 job 996212):
+        # the tile's four quarters take u0..u3 of the same BLOCK / 4 counters, which no other tile or row uses.
+        u0, u1, u2, u3 = tl.rand4x(seed, row * vocab_size + tile * BLOCK + tl.arange(0, BLOCK // 4))
+        uniform = tl.reshape(tl.join(tl.join(u0, u1), tl.join(u2, u3)), [BLOCK])
         gumbel = -tl.log(-tl.log(tl.maximum(uniform, 1e-20)))
         gumbel_max, gumbel_index = tl.max(tl.where(mask, scaled + gumbel, float("-inf")), axis=0, return_indices=True)
         partial = row * tiles + tile
@@ -116,7 +121,12 @@ if triton is not None:
         tl.store(log_norms_ptr + row, log_norm)
 
 
-def fused_sample(logits: torch.Tensor, temperatures: torch.Tensor, block: int = 1024):
+# Tile width and warps per program of fused_sample's first kernel; the environment overrides are for bench_sampler.py.
+SAMPLE_BLOCK = int(os.environ.get("NANOVLLM_SAMPLE_BLOCK", "1024"))
+SAMPLE_WARPS = int(os.environ.get("NANOVLLM_SAMPLE_WARPS", "4"))
+
+
+def fused_sample(logits: torch.Tensor, temperatures: torch.Tensor, block: int = SAMPLE_BLOCK, num_warps: int = SAMPLE_WARPS):
     """What Sampler and DraftSampler compute, as two Triton kernels: a sample from
     softmax(logits / temperature) per row by the Gumbel-max trick (the argmax where the temperature
     is 0) and the log-sum-exp of logits / temperature, (batch_size,) int64 tokens and (batch_size,)
@@ -129,8 +139,10 @@ def fused_sample(logits: torch.Tensor, temperatures: torch.Tensor, block: int = 
     (A40 jobs 278958, 279567, 281207: 164-207 us of GPU time per call at batch 32 in all three
     versions). Here every (row, tile of `block` logits) is its own program, the tile is read once
     into registers and reduced three ways there, the noise is generated in registers, and a second
-    kernel combines the batch_size * tiles partial results: 7 floats per tile cross memory instead
-    of the logits twice and the noise."""
+    kernel combines the batch_size * tiles partial results: 6 numbers per tile cross memory instead
+    of the logits twice and the noise. A40 job 996212 (1024-wide tiles, 4 warps): 64 us of GPU time
+    per call at batch 32 for either sampler, against 167 / 207 us compiled (6.9 us at batch 1); the
+    first kernel ran at 160 GB/s, instruction-bound, about half of it the Philox generator."""
     batch_size, vocab_size = logits.shape
     tiles = triton.cdiv(vocab_size, block)
     partials = [torch.empty(batch_size, tiles, device=logits.device, dtype=dtype)
@@ -138,7 +150,7 @@ def fused_sample(logits: torch.Tensor, temperatures: torch.Tensor, block: int = 
     tokens = torch.empty(batch_size, device=logits.device, dtype=torch.int64)
     log_norms = torch.empty(batch_size, device=logits.device, dtype=torch.float32)
     seed = int(torch.randint(0, 2**31 - 1, (), dtype=torch.int64))    # from torch's CPU generator, so torch.manual_seed fixes the samples
-    _sample_tiles_kernel[(batch_size, tiles)](logits.contiguous(), temperatures, *partials, vocab_size, tiles, seed, BLOCK=block)
+    _sample_tiles_kernel[(batch_size, tiles)](logits.contiguous(), temperatures, *partials, vocab_size, tiles, seed, BLOCK=block, num_warps=num_warps)
     _sample_rows_kernel[(batch_size,)](temperatures, *partials, tokens, log_norms, tiles, BLOCK=triton.next_power_of_2(tiles))
     return tokens, log_norms
 
