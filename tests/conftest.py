@@ -5,6 +5,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import torch  # noqa: E402
+
+if not torch.cuda.is_available():
+    # Run the Triton kernels (fused_sample) in Triton's CPU interpreter. Read when triton.language
+    # is imported, so before cpu_shims and nanovllm import it.
+    os.environ.setdefault("TRITON_INTERPRET", "1")
+
 from cpu_shims import HAS_CUDA  # noqa: E402  (must run before nanovllm is imported)
 
 

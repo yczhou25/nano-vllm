@@ -50,15 +50,113 @@ def exponential_like(x: torch.Tensor) -> torch.Tensor:
     return torch.rand_like(x).clamp_min_(1e-20).log_().neg_()
 
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:    # CPU-only install: the samplers keep their compiled torch path
+    triton = None
+
+
+if triton is not None:
+
+    @triton.jit(do_not_specialize=["seed"])    # Triton specializes integer arguments on == 1 and % 16 == 0: a seed must not recompile
+    def _sample_tiles_kernel(logits_ptr, temperatures_ptr, greedy_max_ptr, greedy_index_ptr, scaled_max_ptr,
+                             scaled_sum_ptr, gumbel_max_ptr, gumbel_index_ptr, vocab_size, tiles, seed,
+                             BLOCK: tl.constexpr):
+        """Stage 1 of fused_sample, one program per (row, tile of BLOCK logits): the tile's max and
+        its index (the greedy token), the max and the sum of exp of the scaled logits (its log-sum-exp
+        as two numbers) and the max and index of the scaled logits plus Gumbel noise (the sample), all
+        from one read of the tile; the noise is generated in registers (tl.rand, a Philox counter from
+        the element's position and the call's seed) and never stored."""
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offsets = tile * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < vocab_size
+        logits = tl.load(logits_ptr + row * vocab_size + offsets, mask=mask, other=float("-inf")).to(tl.float32)
+        greedy_max, greedy_index = tl.max(logits, axis=0, return_indices=True)
+        temperature = tl.maximum(tl.load(temperatures_ptr + row), 1e-10)
+        scaled = logits / temperature
+        scaled_max = tl.max(scaled, axis=0)
+        scaled_sum = tl.sum(tl.exp(scaled - tl.where(scaled_max == float("-inf"), 0.0, scaled_max)), axis=0)
+        uniform = tl.rand(seed, row * vocab_size + offsets)
+        gumbel = -tl.log(-tl.log(tl.maximum(uniform, 1e-20)))
+        gumbel_max, gumbel_index = tl.max(tl.where(mask, scaled + gumbel, float("-inf")), axis=0, return_indices=True)
+        partial = row * tiles + tile
+        tl.store(greedy_max_ptr + partial, greedy_max)
+        tl.store(greedy_index_ptr + partial, greedy_index + tile * BLOCK)
+        tl.store(scaled_max_ptr + partial, scaled_max)
+        tl.store(scaled_sum_ptr + partial, scaled_sum)
+        tl.store(gumbel_max_ptr + partial, gumbel_max)
+        tl.store(gumbel_index_ptr + partial, gumbel_index + tile * BLOCK)
+
+    @triton.jit
+    def _sample_rows_kernel(temperatures_ptr, greedy_max_ptr, greedy_index_ptr, scaled_max_ptr, scaled_sum_ptr,
+                            gumbel_max_ptr, gumbel_index_ptr, tokens_ptr, log_norms_ptr, tiles, BLOCK: tl.constexpr):
+        """Stage 2 of fused_sample, one program per row: the greedy token from the first tile with the
+        largest max (ties go to the first index, as in torch.argmax), the row's log-sum-exp from the
+        tiles' maxima and sums, the sampled token from the tile with the largest noisy max, and the
+        greedy token where the temperature is 0."""
+        row = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < tiles
+        partials = row * tiles + offsets
+        greedy_max = tl.load(greedy_max_ptr + partials, mask=mask, other=float("-inf"))
+        _, greedy_tile = tl.max(greedy_max, axis=0, return_indices=True)
+        greedy_token = tl.load(greedy_index_ptr + row * tiles + greedy_tile)
+        scaled_max = tl.load(scaled_max_ptr + partials, mask=mask, other=float("-inf"))
+        scaled_sum = tl.load(scaled_sum_ptr + partials, mask=mask, other=0.0)
+        row_max = tl.max(scaled_max, axis=0)
+        safe_max = tl.where(row_max == float("-inf"), 0.0, row_max)
+        log_norm = safe_max + tl.log(tl.sum(scaled_sum * tl.exp(scaled_max - safe_max), axis=0))
+        gumbel_max = tl.load(gumbel_max_ptr + partials, mask=mask, other=float("-inf"))
+        _, gumbel_tile = tl.max(gumbel_max, axis=0, return_indices=True)
+        sample_token = tl.load(gumbel_index_ptr + row * tiles + gumbel_tile)
+        token = tl.where(tl.load(temperatures_ptr + row) == 0.0, greedy_token, sample_token)
+        tl.store(tokens_ptr + row, token.to(tl.int64))
+        tl.store(log_norms_ptr + row, log_norm)
+
+
+def fused_sample(logits: torch.Tensor, temperatures: torch.Tensor, block: int = 1024):
+    """What Sampler and DraftSampler compute, as two Triton kernels: a sample from
+    softmax(logits / temperature) per row by the Gumbel-max trick (the argmax where the temperature
+    is 0) and the log-sum-exp of logits / temperature, (batch_size,) int64 tokens and (batch_size,)
+    float32 log-norms, for logits (batch_size, vocab_size) of any float dtype.
+
+    The compiled torch version (Sampler/DraftSampler's CPU path) is bound by Inductor's choices:
+    it never splits a reduction with an argmax across thread blocks, it materializes every random
+    tensor (19 MB of noise for 32 rows of 151936, read back by the argmax), and whether the chunked
+    reductions of 62ddc96 came out as one persistent pass or a looped one was not under our control
+    (A40 jobs 278958, 279567, 281207: 164-207 us of GPU time per call at batch 32 in all three
+    versions). Here every (row, tile of `block` logits) is its own program, the tile is read once
+    into registers and reduced three ways there, the noise is generated in registers, and a second
+    kernel combines the batch_size * tiles partial results: 7 floats per tile cross memory instead
+    of the logits twice and the noise."""
+    batch_size, vocab_size = logits.shape
+    tiles = triton.cdiv(vocab_size, block)
+    partials = [torch.empty(batch_size, tiles, device=logits.device, dtype=dtype)
+                for dtype in (torch.float32, torch.int32, torch.float32, torch.float32, torch.float32, torch.int32)]
+    tokens = torch.empty(batch_size, device=logits.device, dtype=torch.int64)
+    log_norms = torch.empty(batch_size, device=logits.device, dtype=torch.float32)
+    seed = int(torch.randint(0, 2**31 - 1, (), dtype=torch.int64))    # from torch's CPU generator, so torch.manual_seed fixes the samples
+    _sample_tiles_kernel[(batch_size, tiles)](logits.contiguous(), temperatures, *partials, vocab_size, tiles, seed, BLOCK=block)
+    _sample_rows_kernel[(batch_size,)](temperatures, *partials, tokens, log_norms, tiles, BLOCK=triton.next_power_of_2(tiles))
+    return tokens, log_norms
+
+
 class Sampler(nn.Module):
+    """A sample from softmax(logits / temperature) per row, by the Gumbel-max trick on the logits
+    (argmax(logits / T - log E), E ~ Exp(1): no softmax); the argmax where the temperature is 0.
+    On the GPU the Triton kernels of fused_sample; elsewhere the compiled torch version below."""
+
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        if logits.is_cuda and triton is not None:
+            return fused_sample(logits, temperatures)[0]
+        return self.torch_forward(logits, temperatures)
 
     # Compiled once for symbolic shapes: the batch size changes with every tail batch, and with adaptive
     # speculation the number of tokens per sequence too; a recompile per shape costs seconds each.
     @torch.compile(dynamic=True)
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        """A sample from softmax(logits / temperature) per row, by the Gumbel-max trick on the
-        logits (argmax(logits / T - log E), E ~ Exp(1): no softmax); the argmax where the
-        temperature is 0."""
+    def torch_forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         greedy_tokens = chunked_argmax(logits)
         scaled = logits.float() / temperatures.clamp_min(1e-10).unsqueeze(dim=1)
         sample_tokens = chunked_argmax(scaled - exponential_like(scaled).log_())
@@ -147,12 +245,17 @@ class DraftSampler(nn.Module):
     themselves (argmax(logits / T - log E), E ~ Exp(1)), so no softmax is computed or stored,
     and the log-sum-exp of logits / T (batch_size,), with which RejectionSampler reads q from
     the same logits. A greedy sequence (temperature 0) drafts the argmax (the sampler does not
-    read its q). Compiled like the samplers, for the same reason; its reductions are chunked
-    (chunked_argmax) since it runs k times per step: 4 calls of 183 us each at batch 32 were most
-    of what sampled drafts cost per step (A40 job 278958)."""
+    read its q). It runs k times per step, and 4 calls of 183 us each at batch 32 were most of
+    what sampled drafts cost per step (A40 job 278958), so on the GPU it is the Triton kernels of
+    fused_sample; elsewhere the compiled torch version below, with chunked reductions."""
+
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        if logits.is_cuda and triton is not None:
+            return fused_sample(logits, temperatures)
+        return self.torch_forward(logits, temperatures)
 
     @torch.compile(dynamic=True)
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+    def torch_forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         greedy_tokens = chunked_argmax(logits)
         scaled = logits.float() / temperatures.clamp_min(1e-10).unsqueeze(dim=1)
         log_norms = chunked_logsumexp(scaled)
