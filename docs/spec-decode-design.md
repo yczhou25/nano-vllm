@@ -577,6 +577,23 @@ q 收进采样器之后（2026-11-04，log-sum-exp 由 `DraftSampler` 算的版�
 - **改法（e88f54d）**：`chunked_argmax(x)` 把最后一维 view 成 `(…, 128, V/128)`（128 取能整除词表的最大 2 的幂，Qwen3 的 151936 = 2^7 × 1187 正好 128），每块 `max(dim=-1)` 得到值和块内下标，再对 128 个块值取 argmax、加上块偏移——结果和 `torch.argmax` 逐位相同（并列取第一个，两级都如此），第一级有 `rows × 128` 个输出可以铺满 GPU；`chunked_logsumexp` 同样两级。三个采样器所有对词表的归约都换成这两个；噪声改成 `-log(rand)`；主采样器也顺手改成在 logits 上做 Gumbel-max（不再先算 softmax）。CPU：2157 个测试全过，新加的用例核对 6 种词表大小（含奇数、单块退化）、并列、−inf 行、列切片下两级归约和原版逐位相同，`exponential_like` 的均值和方差是 1；再注入 19 种 bug（上表 12 种改写到新代码，加上块偏移忘加 / 偏移乘错 / 取最小块 / 第二级用 max 代替 log-sum-exp / 噪声不取对数 / 残差除以 log E / 贪心行比错行）全部抓到；预热后零重编译照旧。第四次作业 `cluster/nanovllm-sampled4-a40.sbatch`：GPU 测试，`bench_sampler.py`（单独计时三个采样器每次调用的微秒数，新旧 `sampler.py` 各跑一遍），再跑 278958 的 17 行。
 - 顺带记一条 CPU 重编译检查暴露的旧问题：`RejectionSampler.forward` 的变体（统一 / ragged × 有无 `draft_logits` × batch 8 / 1）在 CPU 脚本里是 9 个，超过 `torch._dynamo` 默认的 `recompile_limit=8`，第 9 张图退回 eager。真实的 `warmup_samplers` 不开 `speculative_per_sequence` 时只有 4 个变体，开了会撞上；a5c238c 之前就这样，还没处理。
 
+### 复测 3（作业 279567，2026-11-09，代码 a7e5957 = e88f54d 的采样器，49 分钟，300 W 节点）
+
+脚本 `cluster/nanovllm-sampled4-a40.sbatch`：GPU 测试（50 过、20 跳），`bench_sampler.py` 单独计时每个采样器每次调用的微秒数（新旧 `sampler.py` 各跑一遍），再跑 278958 的 17 行。原始行在 `docs/benchmarks/qwen3-8b-a40-sampled.txt` 第三段，微基准在 `results/279567/bench_sampler.txt`。
+
+| 每次调用 µs | batch 1 旧 → 新 | batch 8 旧 → 新 | batch 32 旧 → 新 |
+|---|---|---|---|
+| `Sampler` | 172 → 118 | 167 → 138 | 201 → 188 |
+| `DraftSampler` | 224 → 137 | 186 → 156 | 219 → 220 |
+| `RejectionSampler`，one-hot 草稿 | 296 → 351 | 318 → 367 | 584 → 794 |
+| `RejectionSampler`，采样草稿 | 320 → 345 | 728 → 493 | 994 → 1045 |
+| 参照：eager `argmax` / `logsumexp` | 12 / 83 | 12 / 84 | 30 / 320 |
+
+- **单行的判断对了，batch 32 的没对**。batch 1 上 `Sampler` 和 `DraftSampler` 快了 31% / 39%：一个线程块串行扫 15 万个元素的那条延迟链确实没了。但 batch 32 上 `DraftSampler` 原地不动（219 → 220），拒绝采样器反而慢了 36%。端到端：chat batch 32 采样草稿比 argmax 草稿每步多 0.8–1.5 ms（278958 里是 2.0），batch 8 多 0.5，batch 1 持平；吞吐采样 / argmax 为 +2.0% / +3.6%（两次）、开关 −0.7%、batch 8 +3.6%、batch 1 +7.5%（这次接受率碰巧 0.448）、混合 +1.7%；T=0 对照 token 和步数仍完全相同。
+- **profiler 说明了为什么**（采样行里 `DraftSampler` 每次调用的 5 个 kernel）：`triton_poi_fused_rand_like` 24.5 µs——噪声还是先写成 19 MB 的张量：Inductor 的 `inductor_random` 对每个随机张量都 `realize()`（`lowering.py`），噪声根本不可能融进消费它的 kernel，`exponential_` 换 `rand` 白换；`triton_red_fused_logsumexp_max` 105 µs——第一级归约（greedy 的 max+下标和 log-sum-exp）是 **looped** 归约：块宽 1187 超过 Inductor persistent 归约的上限 1024，log-sum-exp 的 max 和 sum 两遍各读一次 logits；`triton_red_fused_max` 52 µs——Gumbel 那一支再读一遍 logits 加 19 MB 噪声；两个第二级 kernel 各 2 µs。内存流量从旧版的"读一遍 logits + 噪声写读各一次"涨到了三遍 logits，正好抵消了并行度的收益。拒绝采样器里对 `(B·k, V)` 的 log-sum-exp 本来 Inductor 自己会切分（它不带 argmax），分块反而让它和 greedy 的 argmax 融成了一个两遍读 39 MB 的 looped kernel（384–400 µs/步，之前没有这么大的一项）。
+- **改法（下一版）**：块缩到 ≤1024 个元素——`_chunks` 取能整除词表的、不超过 1024 的最大 2 的幂做块宽（151936 → 128 宽、1187 块），这样第一级是 persistent 归约，一块留在寄存器里，max、下标、log-sum-exp 的 max 和 sum、Gumbel 的 max 都从同一次读取里出，再加 `bench_sampler.py --profile`（每个算子的 CUDA kernel、每次调用的启动数和微秒数），第五次作业 `cluster/nanovllm-sampled5-a40.sbatch` 三个版本（新、e88f54d、a5c238c）同场比。
+- 每步剩下的开销里还有一项不在 GPU 上：batch 1 的 `DraftSampler` 137 µs 里 GPU 只干了几十微秒，其余是每次编译函数调用的 CPU 开销（Dynamo 守卫 + 5 个 kernel 的启动）；一步调 4 次就是 0.4–0.5 ms，只有把采样器放进 CUDA graph 才能省掉，而那要求形状固定。
+
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。
